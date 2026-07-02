@@ -69,7 +69,8 @@ final class PerFieldMergeState {
         in.maxDocs,
         in.infoStream,
         in.intraMergeTaskExecutor,
-        in.needsIndexSort);
+        in.needsIndexSort,
+        in.oneMerge);
   }
 
   private static class FilterFieldInfos extends FieldInfos {
@@ -109,11 +110,10 @@ final class PerFieldMergeState {
           this.filtered.add(fi);
           hasVectors |= fi.hasTermVectors();
           hasPostings |= fi.getIndexOptions() != IndexOptions.NONE;
-          hasProx |= fi.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+          hasProx |= fi.getIndexOptions().subsumes(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS);
           hasFreq |= fi.getIndexOptions() != IndexOptions.DOCS;
           hasOffsets |=
-              fi.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS)
-                  >= 0;
+              fi.getIndexOptions().subsumes(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS);
           hasNorms |= fi.hasNorms();
           hasDocValues |= fi.getDocValuesType() != DocValuesType.NONE;
           hasPayloads |= fi.hasPayloads();
@@ -242,7 +242,7 @@ final class PerFieldMergeState {
     }
 
     @Override
-    public Terms terms(String field) throws IOException {
+    public Terms terms(String field) {
       if (!filtered.contains(field)) {
         throw new IllegalArgumentException(
             "The field named '"

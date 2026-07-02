@@ -898,6 +898,7 @@ public final class Lucene90CompressingTermVectorsWriter extends TermVectorsWrite
     for (int i = 0; i < numReaders; i++) {
       final TermVectorsReader reader = mergeState.termVectorsReaders[i];
       if (reader != null) {
+        mergeState.checkAborted();
         reader.checkIntegrity();
       }
       final boolean bulkMerge = canPerformBulkMerge(mergeState, matchingReaders, i);
@@ -950,9 +951,7 @@ public final class Lucene90CompressingTermVectorsWriter extends TermVectorsWrite
   private boolean canPerformBulkMerge(
       MergeState mergeState, MatchingReaders matchingReaders, int readerIndex) {
     if (mergeState.termVectorsReaders[readerIndex]
-        instanceof Lucene90CompressingTermVectorsReader) {
-      final Lucene90CompressingTermVectorsReader reader =
-          (Lucene90CompressingTermVectorsReader) mergeState.termVectorsReaders[readerIndex];
+        instanceof Lucene90CompressingTermVectorsReader reader) {
       return BULK_MERGE_ENABLED
           && matchingReaders.matchingReaders[readerIndex]
           && reader.getCompressionMode() == compressionMode

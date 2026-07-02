@@ -696,7 +696,7 @@ public final class Operations {
 
     while (worklist.size() > 0) {
       // TODO (LUCENE-9983): these int sets really do not need to be sorted, and we are paying
-      // a high (unecessary) price for that!  really we just need a low-overhead Map<int,int>
+      // a high (unnecessary) price for that!  really we just need a low-overhead Map<int,int>
       // that implements equals/hash based only on the keys (ignores the values).  fixing this
       // might be a bigspeedup for determinizing complex automata
       FrozenIntSet s = worklist.removeFirst();
@@ -1372,9 +1372,7 @@ public final class Operations {
 
     if (upto < states.length) {
       // There were dead states
-      int[] newStates = new int[upto];
-      System.arraycopy(states, 0, newStates, 0, upto);
-      states = newStates;
+      states = ArrayUtil.copyOfSubArray(states, 0, upto);
     }
 
     // Reverse the order:

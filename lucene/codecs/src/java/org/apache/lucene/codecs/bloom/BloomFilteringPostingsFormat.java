@@ -191,7 +191,7 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
     }
 
     @Override
-    public Terms terms(String field) throws IOException {
+    public Terms terms(String field) {
       FuzzySet filter = bloomsByFieldName.get(field);
       if (filter == null) {
         return delegateFieldsProducer.terms(field);
@@ -245,7 +245,7 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
       }
 
       @Override
-      public int getDocCount() throws IOException {
+      public int getDocCount() {
         return delegateTerms.getDocCount();
       }
 
@@ -298,7 +298,7 @@ public final class BloomFilteringPostingsFormat extends PostingsFormat {
       private TermsEnum delegate() throws IOException {
         if (delegateTermsEnum == null) {
           /* pull the iterator only if we really need it -
-           * this can be a relativly heavy operation depending on the
+           * this can be a relatively heavy operation depending on the
            * delegate postings format and they underlying directory
            * (clone IndexInput) */
           delegateTermsEnum = delegateTerms.iterator();
