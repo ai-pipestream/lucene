@@ -1,3 +1,22 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
 # Cross-Shard Optimistic kNN — design
 
 **Status:** draft v1 · **Date:** 2026-07-04
@@ -110,18 +129,27 @@ public final class GlobalKnnFloor {
 
   public GlobalKnnFloor(int k) { ... }
 
-  /** Batch-offer locally collected scores (ascending). Returns the current floor. */
+  /** Batch-offer locally observed scores (ascending). Returns the current floor. */
   public float offer(float[] scores, int len) { ... }
 
   /** External feed, called from transport threads (gRPC handlers, scout callback).
-   *  Keyed slot per source: max-replace within the slot, never across slots.
-   *  sourceId 0 = coordinator (star mode); per-shard ids in mesh mode. */
-  public void advertise(int sourceId, float kthBestLowerBound) { ... }
+   *  Monotonic max: values at or below the current floor are ignored, so duplicated
+   *  or reordered remote deliveries need no special handling. */
+  public void advertise(float kthBestLowerBound) { ... }
 
-  /** Lock-free read of the current floor; NEGATIVE_INFINITY until k scores observed. */
-  public float floor() { return floor; }
+  /** Lock-free read of the current floor; NEGATIVE_INFINITY until k scores observed
+   *  and nothing has been advertised. Never decreases. */
+  public float floor() { ... }
 }
 ```
+
+**Why `advertise` carries no source id (implementation decision):** for scalar lower bounds
+reduced by `max`, per-source slots are mathematically redundant — the max of everything ever
+received equals the max over per-source maxima, and monotonicity makes conflating senders
+harmless. Shard identity therefore stays at the transport layer (the coordinator already knows
+which stream each hit came from), and a keyed API becomes necessary only if richer per-shard
+summaries (top-j score vectors) are ever exchanged, which would be a new method rather than a
+retrofit.
 
 - Size-k min-heap of the best scores observed so far, across all feeders. Its min, once the
   heap is full, is a **valid lower bound of the final merged k-th-best** (subset argument,
@@ -130,17 +158,17 @@ public final class GlobalKnnFloor {
   a *lower bound* scalar. Transport, calibration, topology live outside Lucene.
 - **Remote update model.** Shards run in separate JVMs, so floor updates arrive on transport
   threads while search threads are mid-traversal. Safety comes from monotonicity, not
-  locking discipline: each source's floor only rises, so `advertise` is a keyed max-replace
-  — idempotent and commutative, therefore safe under out-of-order or duplicated delivery
-  with no sequence numbers or acks. Search threads observe updates via the volatile cached
-  floor at their next sync boundary (≤ 256 visits later); staleness can only *delay*
+  locking discipline: each source's floor only rises and the reduction is `max`, so
+  `advertise` is idempotent and commutative — safe under out-of-order or duplicated delivery
+  with no sequence numbers, acks, or per-source bookkeeping (see the §4.1 note on why source
+  ids are unnecessary for scalar bounds). Search threads observe updates via the collector's
+  cached floor at their next sync boundary (≤ 256 visits later); staleness can only *delay*
   pruning, never make it unsafe (the floor is a lower bound of the final cutoff at all
-  times). Source identity matters exactly at merge points: star mode has one external
-  source (the coordinator's pre-merged scalar, sourceId 0); mesh mode gives each shard an
-  integer id and receivers reduce across slots with `max()` — valid but looser than a true
-  merged k-th (`max(local kths) ≤ merged kth`), so mesh-quality floors would need richer
-  per-shard summaries (top-j score vectors) in a future revision, which the keyed API
-  already accommodates.
+  times). Source identity matters exactly at merge points: in star mode the coordinator is
+  the merge point and already keys hits by stream; a future mesh mode reducing per-shard
+  k-th-bests with `max()` is valid but looser than a true merged k-th
+  (`max(local kths) ≤ merged kth`), so mesh-quality floors would need richer per-shard
+  summaries (top-j score vectors) via a new, keyed method.
 - Resurrect `BlockingFloatHeap` from `75d47f09c45^` (it has tests) rather than rewriting.
 - Score-only semantics; termination uses strict `<` so score-ties are never pruned
   (tie-break on doc id then cannot drop a would-be winner; cheaper than encoding doc ids
@@ -151,7 +179,7 @@ public final class GlobalKnnFloor {
 ```java
 public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
   // all knobs package-private constants for PR 1; constructor params if reviewers want them
-  private static final float GREEDINESS = 0.9f;   // MultiLeafKnnCollector default
+  private static final float GREEDINESS = 0.5f;   // conservative default, see note below
   private static final int   SYNC_INTERVAL = 0xff;
 
   private final GlobalKnnFloor globalFloor;
@@ -189,7 +217,7 @@ Three load-bearing decisions, each fixing a measured failure of #15676:
    in sequential execution.
 2. **Greediness clamp instead of hard-stop.** A globally non-competitive leaf is not
    guillotined; its bar is lifted to `min(local non-competitive queue top, global floor)`, so
-   it keeps exploring a thin frontier that preserves bridge paths. `g=0.9` means it retains a
+   it keeps exploring a thin frontier that preserves bridge paths. `g=0.9` would mean it retains a
    `(1-g)·k`-deep escape hatch. This subsumes the old `slack`/found-vs-reachable debate: the
    bar feeds the searcher's *existing* frontier-based break condition
    (`candidates.topScore() < minAcceptedSimilarity`), so the comparison quantity is the
@@ -199,24 +227,32 @@ Three load-bearing decisions, each fixing a measured failure of #15676:
    answer to the memory-bus contention #15676 reported, and removes any need for
    striped/tree floors at realistic core counts.
 
-### 4.3 `CrossShardKnnCollectorManager` — composition with optimistic
+### 4.3 `SharedFloorKnnCollectorManager` — composition with optimistic
 
 ```java
-public final class CrossShardKnnCollectorManager implements KnnCollectorManager {
-  private final int k;
-  private final GlobalKnnFloor floor;   // caller-supplied → externally feedable
+public final class SharedFloorKnnCollectorManager implements KnnCollectorManager {
+  public SharedFloorKnnCollectorManager(int k) { ... }  // owns its floor (in-process queries)
+  public SharedFloorKnnCollectorManager(int k, GlobalKnnFloor floor) { ... }  // externally fed
+  public SharedFloorKnnCollectorManager(int k, GlobalKnnFloor floor, float greediness) { ... }
+
+  public GlobalKnnFloor getGlobalFloor() { ... }  // for callers that feed or read the floor
 
   @Override public KnnCollector newCollector(int visitedLimit, KnnSearchStrategy s, LeafReaderContext ctx) {
-    return new FloorAwareKnnCollector(new TopKnnCollector(k, visitedLimit, s), k, floor);
+    return new FloorAwareKnnCollector(new TopKnnCollector(k, visitedLimit, s), globalFloor, greediness);
   }
   @Override public KnnCollector newOptimisticCollector(int visitedLimit, KnnSearchStrategy s,
                                                        LeafReaderContext ctx, int perLeafK) {
-    // note: gate fills at perLeafK (the leaf's owed contribution), floor heap stays size k
-    return new FloorAwareKnnCollector(new TopKnnCollector(perLeafK, visitedLimit, s), perLeafK, floor);
+    // gate fills at perLeafK (the leaf's owed contribution); the floor heap stays size k
+    return new FloorAwareKnnCollector(new TopKnnCollector(perLeafK, visitedLimit, s), globalFloor, greediness);
   }
   @Override public boolean isOptimistic() { return true; }
 }
 ```
+
+One manager (and one floor) per query execution — both carry single-query state. Harness
+usage: subclass `KnnFloatVectorQuery`, create the manager in the constructor, return it from
+`getKnnCollectorManager` (it is called for both collection passes, which is what lets phase 2
+start from the phase-1 floor).
 
 - `isOptimistic() == true` means `AbstractKnnVectorQuery` gives every leaf the reduced
   `perLeafTopK` in phase 1 and runs its normal re-entry phase — **we inherit the optimistic
@@ -254,7 +290,7 @@ The distributed deployment reuses `GlobalKnnFloor.advertise()` as its entire int
   hold the same document (replicas, global-ID joined indexes), the coordinator must dedup
   by global doc id *before* heap insertion — duplicated hits would inflate the merged
   k-th-best above the true cutoff and break the lower-bound invariant.
-- **Shard:** runs `CrossShardKnnCollectorManager` with a `GlobalKnnFloor` whose `advertise()`
+- **Shard:** runs `SharedFloorKnnCollectorManager` with a `GlobalKnnFloor` whose `advertise()`
   is fed by coordinator messages. Local leaves and remote floor tighten the same object.
 - **Per-shard k:** the coordinator applies `perLeafTopKCalculation(k, shardProportion)` to
   set each shard's request k — the 16-shard/k=10,000 case sends ~1,000 per shard, and the
@@ -305,8 +341,13 @@ approximation stock makes, at a tighter bar, with two explicit compensators":
    preserving a `(1-g)·k`-deep exploration frontier for bridges.
 
 Consequently recall parity is an **empirical acceptance criterion** (§8), not a theorem.
-`g` is the recall/visits dial: `g=0` is stock, `g=1` is hard-stop; 0.9 shipped in Lucene 9.x
-as the `MultiLeafKnnCollector` default and is our starting point.
+`g` is the recall/visits dial: `g=0` is stock, `g=1` is hard-stop. 0.9 shipped in Lucene 9.x as
+the `MultiLeafKnnCollector` default, but randomized small-k unit testing showed it costing
+several points of recall (at small k, `(1-g)·k` leaves too few non-competitive slots for the
+clamp to protect navigation paths), so the implementation defaults to a conservative **g=0.5**
+and treats raising it as a measured, per-dataset trade (§11 sweeps). Unit tests pin the safe
+endpoint: at `g=0`, even the tightest valid advertised bound (the exact final k-th best) must
+not cost recall versus stock.
 
 ## 7. Determinism
 
@@ -371,7 +412,7 @@ Housekeeping before clean runs: remove `DEBUG q0` prints in `KnnGraphTester.java
 4. Keep `bench/collab-plus-distinctdocs` for A/B history; never merge it anywhere.
 
 Diff budget for PR 1: `GlobalKnnFloor`, `FloorAwareKnnCollector`,
-`CrossShardKnnCollectorManager`, resurrected `BlockingFloatHeap` (+ its old tests), new unit
+`SharedFloorKnnCollectorManager`, resurrected `BlockingFloatHeap` (+ its old tests), new unit
 tests, CHANGES entry. No `HnswGraphSearcher` changes, no `AbstractKnnVectorQuery` changes,
 no new top-level strategy interface.
 
@@ -526,7 +567,7 @@ Arms (same index, same seed, every run): **(1)** stock = current-main optimistic
 
 Execution matrix per arm: {sequential, parallel-16} × fanout {0, 50, 100, 200, 400, 800},
 emitting one CSV row per point → Pareto curves of visits vs recall. Parameter sweeps
-(`g ∈ {0.7, 0.8, 0.9, 0.95, 1.0}`, sync interval ∈ {63, 255, 1023}, gate-fill ∈
+(`g ∈ {0.3, 0.5, 0.7, 0.9, 1.0}`, sync interval ∈ {63, 255, 1023}, gate-fill ∈
 {perLeafTopK, k}, floor heap ∈ {k, k+fanout}) run **only** on the small index.
 
 Decision gates before scaling up:
@@ -550,7 +591,7 @@ produces the §1 headline table:
 | D2 | perShardK | gRPC-fed | — | floor contribution (§10.4) |
 | D3 | perShardK | gRPC-fed | seeded | scout contribution (§10.5) |
 
-Wiring: swap `CollaborativeKnnCollectorManager` → `CrossShardKnnCollectorManager` in
+Wiring: swap `CollaborativeKnnCollectorManager` → `SharedFloorKnnCollectorManager` in
 `KnnNodeService` (the coordinator's `floorHeap`/broadcast loop in `KnnResource` is already
 correct and stays); apply `perShardK` in the request builder; scout = one extra node holding
 a rescoring int8 replica of a 1/16 sample, advertising once per query. Retire the 5×
@@ -578,7 +619,8 @@ every sweep point; anything less and the PR does not go out.
 2. Should `newOptimisticCollector`'s gate fill at `perLeafTopK` (current choice — earlier
    global influence, matches what the leaf "owes") or at full `k` (later, safer)? Step-2
    sweep decides.
-3. Expose `greediness` as a constructor knob in PR 1 or hold constant at 0.9? Lean constant
-   (smaller API), sweep internally.
+3. Greediness is exposed as a constructor knob (default 0.5); should the default instead scale
+   with k so large-k searches keep a bounded absolute number of non-competitive slots? Decide
+   from the §11 sweeps.
 4. Scout calibration: fixed margin δ vs full-precision rescore of scout top-k. Lean rescore
    (exact, trivially cheap, no tuning).

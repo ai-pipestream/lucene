@@ -1,0 +1,190 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.lucene.search.knn;
+
+import org.apache.lucene.search.AbstractKnnCollector;
+import org.apache.lucene.search.KnnCollector;
+import org.apache.lucene.util.hnsw.FloatHeap;
+
+/**
+ * A {@link org.apache.lucene.search.KnnCollector.Decorator} that raises its {@link
+ * #minCompetitiveSimilarity()} using a {@link GlobalKnnFloor} shared with the other searchers of
+ * the same query, so that a graph search stops exploring candidates that cannot enter the query's
+ * final, merged top-k, not merely candidates that cannot enter this collector's local top-k.
+ *
+ * <p>The graph searcher already re-reads {@link #minCompetitiveSimilarity()} whenever a collected
+ * hit reports an improvement, and uses it both to stop the search when the best remaining candidate
+ * falls below it and to avoid enqueueing hopeless candidates. Folding the shared floor into that
+ * method is therefore the entire integration: no searcher changes are required, and a collector
+ * whose floor never rises behaves exactly like its delegate.
+ *
+ * <p>Three guards keep the shared bound from harming recall or becoming a synchronization hot spot:
+ *
+ * <ul>
+ *   <li><b>Ascent gate.</b> The shared floor is ignored until this collector has gathered its own k
+ *       results. A graph search begins at an entry point that is usually far from the query, and
+ *       every score observed while descending toward the query's neighborhood is uninformative; a
+ *       bound derived from an already-converged sibling would terminate the search before it had a
+ *       chance to find anything. Once the local queue is full, the search has reached its
+ *       neighborhood and competitiveness against the rest of the query is meaningful.
+ *   <li><b>Greediness clamp.</b> Even after the gate opens, the effective bound is capped by the
+ *       similarity of the {@code (1 - greediness) * k}-th best score this collector has seen. A
+ *       search that is globally non-competitive is thus throttled rather than stopped outright: it
+ *       keeps following its most promising frontier, which preserves the paths through mediocre
+ *       intermediate nodes that graph navigation depends on. At {@code greediness = 0} the floor
+ *       has no effect; at {@code greediness = 1} the collector stops as soon as its best frontier
+ *       cannot beat the floor.
+ *   <li><b>Batched synchronization.</b> Scores are published to the shared floor, and the floor is
+ *       re-read, only when the local queue first fills and every {@value #SYNC_INTERVAL} visited
+ *       vectors afterwards, so the shared state is touched a constant number of times per few
+ *       hundred scored candidates rather than once per candidate. A stale floor can only delay
+ *       termination, never cause a wrong result, so the interval trades a bounded amount of extra
+ *       work for the absence of cross-thread traffic in the scoring loop.
+ * </ul>
+ *
+ * <p>The effective bound derived from the floor is one ulp below the floor itself. The floor is the
+ * similarity of a real collected hit, and when several hits tie at the cutoff the merged result set
+ * is decided by tie-breaking, not by score; a search must therefore remain willing to find
+ * candidates exactly at the floor, otherwise a document that would have won the tie-break could be
+ * abandoned. Keeping the bound strictly below the floor preserves those ties without publishing
+ * document identities.
+ *
+ * <p>Instances are confined to a single thread, like every {@link KnnCollector}; only the shared
+ * {@link GlobalKnnFloor} is touched by multiple threads.
+ *
+ * @lucene.experimental
+ */
+public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
+
+  /**
+   * Default fraction of the search effort that follows the shared floor rather than the local
+   * frontier; see the class comment for the roles of the two extremes. The default is deliberately
+   * conservative: at small k the local queue is small, and a larger greediness leaves so few
+   * non-competitive slots that the clamp stops protecting navigation paths, which measurably costs
+   * recall. Callers who have verified recall on their own data may trade some of it for fewer
+   * visits by raising this.
+   */
+  public static final float DEFAULT_GREEDINESS = 0.5f;
+
+  /**
+   * Number of visited vectors between synchronizations with the shared floor. Must be one less than
+   * a power of two, as it is used as a bit mask over {@link #visitedCount()}.
+   */
+  private static final int SYNC_INTERVAL = 0xff;
+
+  private final AbstractKnnCollector subCollector;
+  private final GlobalKnnFloor globalFloor;
+
+  /**
+   * The best {@code (1 - greediness) * k} similarities seen by this collector, competitive or not.
+   * Its minimum caps the effective bound, implementing the greediness clamp.
+   */
+  private final FloatHeap nonCompetitiveQueue;
+
+  /** Similarities observed since the last synchronization, awaiting publication. */
+  private final FloatHeap updatesQueue;
+
+  /** Scratch used to drain {@link #updatesQueue} in ascending order for batch publication. */
+  private final float[] updatesScratch;
+
+  private boolean kResultsCollected;
+  private float cachedGlobalFloor = Float.NEGATIVE_INFINITY;
+
+  /**
+   * Create a collector applying the {@link #DEFAULT_GREEDINESS default greediness}.
+   *
+   * @param subCollector the collector gathering this searcher's local results
+   * @param globalFloor the floor shared by all searchers of this query
+   */
+  public FloorAwareKnnCollector(AbstractKnnCollector subCollector, GlobalKnnFloor globalFloor) {
+    this(subCollector, globalFloor, DEFAULT_GREEDINESS);
+  }
+
+  /**
+   * Create a collector.
+   *
+   * @param subCollector the collector gathering this searcher's local results
+   * @param globalFloor the floor shared by all searchers of this query
+   * @param greediness fraction of the search effort that follows the shared floor, in {@code [0,
+   *     1]}; see the class comment
+   */
+  public FloorAwareKnnCollector(
+      AbstractKnnCollector subCollector, GlobalKnnFloor globalFloor, float greediness) {
+    super(subCollector);
+    if (greediness < 0 || greediness > 1 || Float.isNaN(greediness)) {
+      throw new IllegalArgumentException("greediness must be in [0,1], got: " + greediness);
+    }
+    this.subCollector = subCollector;
+    this.globalFloor = globalFloor;
+    this.nonCompetitiveQueue =
+        new FloatHeap(Math.max(1, Math.round((1 - greediness) * subCollector.k())));
+    this.updatesQueue = new FloatHeap(globalFloor.k());
+    this.updatesScratch = new float[globalFloor.k()];
+  }
+
+  @Override
+  public boolean collect(int docId, float similarity) {
+    boolean localSimUpdated = subCollector.collect(docId, similarity);
+    boolean firstKResultsCollected =
+        kResultsCollected == false && subCollector.numCollected() == k();
+    if (firstKResultsCollected) {
+      kResultsCollected = true;
+    }
+    updatesQueue.offer(similarity);
+    boolean globalSimUpdated = nonCompetitiveQueue.offer(similarity);
+
+    if (kResultsCollected && (firstKResultsCollected || (visitedCount() & SYNC_INTERVAL) == 0)) {
+      // The shared heap requires ascending input; draining the pending min-heap yields exactly
+      // that. Scores observed before the local queue filled are included in the first batch, so
+      // nothing seen during the ascent is lost to the shared floor.
+      int len = updatesQueue.size();
+      if (len > 0) {
+        for (int i = 0; i < len; i++) {
+          updatesScratch[i] = updatesQueue.poll();
+        }
+        assert updatesQueue.size() == 0;
+        cachedGlobalFloor = globalFloor.offer(updatesScratch, len);
+        globalSimUpdated = true;
+      }
+    }
+    // Reporting an update whenever the effective bound may have moved (locally or via the shared
+    // floor) prompts the graph searcher to re-read minCompetitiveSimilarity() and raise its
+    // termination bar promptly.
+    return localSimUpdated || globalSimUpdated;
+  }
+
+  @Override
+  public float minCompetitiveSimilarity() {
+    if (kResultsCollected == false) {
+      // Ascent gate: while the local queue is filling, expose only the delegate's bound, which is
+      // NEGATIVE_INFINITY by the KnnCollector contract. See the class comment.
+      return subCollector.minCompetitiveSimilarity();
+    }
+    // nextDown keeps the bound strictly below the floor so exact score ties at the cutoff remain
+    // reachable; nextDown of NEGATIVE_INFINITY is NEGATIVE_INFINITY, so an undefined floor is a
+    // no-op here.
+    return Math.max(
+        subCollector.minCompetitiveSimilarity(),
+        Math.min(nonCompetitiveQueue.peek(), Math.nextDown(cachedGlobalFloor)));
+  }
+
+  @Override
+  public String toString() {
+    return "FloorAwareKnnCollector[subCollector=" + subCollector + "]";
+  }
+}
