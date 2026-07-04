@@ -34,8 +34,75 @@ public class TestFloorAwareKnnCollector extends LuceneTestCase {
         () -> new FloorAwareKnnCollector(delegate, floor, Float.NaN));
   }
 
+  public void testInvalidMinExplorationSlots() {
+    GlobalKnnFloor floor = new GlobalKnnFloor(4);
+    TopKnnCollector delegate = new TopKnnCollector(4, Integer.MAX_VALUE);
+    expectThrows(
+        IllegalArgumentException.class,
+        () ->
+            new FloorAwareKnnCollector(
+                delegate, floor, 0.5f, 0, FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL));
+    expectThrows(
+        IllegalArgumentException.class,
+        () ->
+            new FloorAwareKnnCollector(
+                delegate, floor, 0.5f, -1, FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL));
+  }
+
+  public void testInvalidSyncInterval() {
+    GlobalKnnFloor floor = new GlobalKnnFloor(4);
+    TopKnnCollector delegate = new TopKnnCollector(4, Integer.MAX_VALUE);
+    // The interval is applied as a bit mask over the visited count, hence the power-of-two
+    // requirement; anything else would synchronize at irregular, surprising points.
+    expectThrows(
+        IllegalArgumentException.class,
+        () ->
+            new FloorAwareKnnCollector(
+                delegate, floor, 0.5f, FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS, 0));
+    expectThrows(
+        IllegalArgumentException.class,
+        () ->
+            new FloorAwareKnnCollector(
+                delegate, floor, 0.5f, FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS, 100));
+    expectThrows(
+        IllegalArgumentException.class,
+        () ->
+            new FloorAwareKnnCollector(
+                delegate, floor, 0.5f, FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS, -8));
+  }
+
+  public void testConfigurableSlotMinimumControlsNeutralization() {
+    // The neutralization property follows the configured minimum, not a baked-in number: with a
+    // slot minimum of 4 at k=8, the clamp is narrower than the local queue and an advertised
+    // floor must bind; with a slot minimum of 8 it must not.
+    int k = 8;
+    for (int slots : new int[] {4, 8}) {
+      GlobalKnnFloor floor = new GlobalKnnFloor(k);
+      floor.advertise(1000f);
+      TopKnnCollector delegate = new TopKnnCollector(k, Integer.MAX_VALUE);
+      FloorAwareKnnCollector collector =
+          new FloorAwareKnnCollector(
+              delegate, floor, 1f, slots, FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL);
+      for (int doc = 0; doc < k; doc++) {
+        collector.incVisitedCount(1);
+        collector.collect(doc, doc + 1f);
+      }
+      if (slots < k) {
+        assertTrue(
+            "a clamp narrower than the local queue must let the floor bind",
+            collector.minCompetitiveSimilarity() > delegate.minCompetitiveSimilarity());
+      } else {
+        assertEquals(
+            "a clamp as wide as the local queue must neutralize the floor",
+            delegate.minCompetitiveSimilarity(),
+            collector.minCompetitiveSimilarity(),
+            0.0f);
+      }
+    }
+  }
+
   public void testAscentGateIgnoresFloorUntilLocalQueueFills() {
-    int k = FloorAwareKnnCollector.MIN_EXPLORATION_SLOTS + 4;
+    int k = FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS + 4;
     GlobalKnnFloor floor = new GlobalKnnFloor(k);
     // A sibling searcher has already converged and established a high floor. A correct collector
     // must not expose it before this searcher has escaped its own ascent, otherwise the graph
@@ -95,7 +162,8 @@ public class TestFloorAwareKnnCollector extends LuceneTestCase {
     // source in this test is the advertised bound.
     GlobalKnnFloor floor = new GlobalKnnFloor(100);
     floor.advertise(2.5f);
-    // greediness 1 collapses the clamp to its absolute minimum of MIN_EXPLORATION_SLOTS entries.
+    // greediness 1 collapses the clamp to its absolute minimum of DEFAULT_MIN_EXPLORATION_SLOTS
+    // entries.
     FloorAwareKnnCollector collector =
         new FloorAwareKnnCollector(new TopKnnCollector(localK, Integer.MAX_VALUE), floor, 1f);
 
@@ -124,7 +192,7 @@ public class TestFloorAwareKnnCollector extends LuceneTestCase {
     // as the local queue, its minimum can never exceed the local k-th best, and the shared floor
     // must have no effect at all: even a hostile advertised bound cannot change the bound stock
     // search would have used.
-    int k = FloorAwareKnnCollector.MIN_EXPLORATION_SLOTS / 2;
+    int k = FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS / 2;
     GlobalKnnFloor floor = new GlobalKnnFloor(k);
     floor.advertise(Float.MAX_VALUE);
     TopKnnCollector delegate = new TopKnnCollector(k, Integer.MAX_VALUE);
@@ -134,7 +202,7 @@ public class TestFloorAwareKnnCollector extends LuceneTestCase {
       collector.incVisitedCount(1);
       collector.collect(doc, random().nextFloat());
       assertEquals(
-          "at k <= MIN_EXPLORATION_SLOTS the bound must be exactly the delegate's",
+          "at k <= the clamp's slot minimum the bound must be exactly the delegate's",
           delegate.minCompetitiveSimilarity(),
           collector.minCompetitiveSimilarity(),
           0.0f);
@@ -145,7 +213,7 @@ public class TestFloorAwareKnnCollector extends LuceneTestCase {
     // k equal to the clamp's absolute minimum makes both local structures the same size, so a
     // score rejected by the local queue is also rejected by the clamp queue and cannot report an
     // update through either.
-    int k = FloorAwareKnnCollector.MIN_EXPLORATION_SLOTS;
+    int k = FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS;
     GlobalKnnFloor floor = new GlobalKnnFloor(k);
     FloorAwareKnnCollector collector =
         new FloorAwareKnnCollector(new TopKnnCollector(k, Integer.MAX_VALUE), floor, 0f);

@@ -52,8 +52,8 @@ import org.apache.lucene.util.NamedThreadFactory;
  *
  * <p>Queries here activate the floor at every k (see {@link SharedFloorKnnQuery}), because the
  * point is to exercise the floor path; the activation default is covered by its own test. The k
- * values exceed {@link FloorAwareKnnCollector#MIN_EXPLORATION_SLOTS}, since at or below it the
- * clamp neutralizes the floor by design and the tests would not be testing anything.
+ * values exceed {@link FloorAwareKnnCollector#DEFAULT_MIN_EXPLORATION_SLOTS}, since at or below it
+ * the clamp neutralizes the floor by design and the tests would not be testing anything.
  */
 public class TestSharedFloorKnnSearch extends LuceneTestCase {
 

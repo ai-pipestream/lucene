@@ -73,6 +73,8 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
   private final GlobalKnnFloor globalFloor;
   private final float greediness;
   private final int floorActivationK;
+  private final int minExplorationSlots;
+  private final int syncInterval;
 
   /**
    * Create a manager with its own floor and the {@link FloorAwareKnnCollector#DEFAULT_GREEDINESS
@@ -113,7 +115,7 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
 
   /**
    * Create a manager around an externally provided floor with an explicit greediness and activation
-   * threshold.
+   * threshold, applying the default slot minimum and sync interval.
    *
    * @param k the number of neighbors the query collects
    * @param globalFloor the floor shared by all searchers of this query; its {@link
@@ -126,6 +128,40 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
    */
   public SharedFloorKnnCollectorManager(
       int k, GlobalKnnFloor globalFloor, float greediness, int floorActivationK) {
+    this(
+        k,
+        globalFloor,
+        greediness,
+        floorActivationK,
+        FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS,
+        FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL);
+  }
+
+  /**
+   * Create a fully configured manager. Every tuning value the mechanism has is a parameter here;
+   * the shorter constructors exist only to supply defaults.
+   *
+   * @param k the number of neighbors the query collects
+   * @param globalFloor the floor shared by all searchers of this query; its {@link
+   *     GlobalKnnFloor#k()} must equal {@code k}
+   * @param greediness fraction of each segment's search effort that follows the shared floor, in
+   *     {@code [0, 1]}; see {@link FloorAwareKnnCollector}
+   * @param floorActivationK the smallest k at which floor sharing engages; for smaller k this
+   *     manager creates plain collectors and the search is exactly stock search. See the class
+   *     comment for the reasoning behind the {@link #DEFAULT_FLOOR_ACTIVATION_K default}.
+   * @param minExplorationSlots smallest permitted size of each collector's greediness clamp queue;
+   *     must be at least 1. See {@link FloorAwareKnnCollector#DEFAULT_MIN_EXPLORATION_SLOTS}.
+   * @param syncInterval number of visited vectors between each collector's synchronizations with
+   *     the shared floor; must be a power of two. See {@link
+   *     FloorAwareKnnCollector#DEFAULT_SYNC_INTERVAL}.
+   */
+  public SharedFloorKnnCollectorManager(
+      int k,
+      GlobalKnnFloor globalFloor,
+      float greediness,
+      int floorActivationK,
+      int minExplorationSlots,
+      int syncInterval) {
     if (k < 1) {
       throw new IllegalArgumentException("k must be at least 1, got: " + k);
     }
@@ -144,10 +180,20 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
       throw new IllegalArgumentException(
           "floorActivationK must be at least 1, got: " + floorActivationK);
     }
+    if (minExplorationSlots < 1) {
+      throw new IllegalArgumentException(
+          "minExplorationSlots must be at least 1, got: " + minExplorationSlots);
+    }
+    if (syncInterval < 1 || Integer.bitCount(syncInterval) != 1) {
+      throw new IllegalArgumentException(
+          "syncInterval must be a power of two, got: " + syncInterval);
+    }
     this.k = k;
     this.globalFloor = globalFloor;
     this.greediness = greediness;
     this.floorActivationK = floorActivationK;
+    this.minExplorationSlots = minExplorationSlots;
+    this.syncInterval = syncInterval;
   }
 
   /** Return the floor shared by this manager's collectors, so that callers may feed or read it. */
@@ -163,7 +209,8 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
     if (k < floorActivationK) {
       return collector;
     }
-    return new FloorAwareKnnCollector(collector, globalFloor, greediness);
+    return new FloorAwareKnnCollector(
+        collector, globalFloor, greediness, minExplorationSlots, syncInterval);
   }
 
   @Override
@@ -177,7 +224,8 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
     if (k < floorActivationK) {
       return collector;
     }
-    return new FloorAwareKnnCollector(collector, globalFloor, greediness);
+    return new FloorAwareKnnCollector(
+        collector, globalFloor, greediness, minExplorationSlots, syncInterval);
   }
 
   @Override

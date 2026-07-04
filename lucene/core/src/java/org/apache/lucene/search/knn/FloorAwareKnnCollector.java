@@ -43,19 +43,20 @@ import org.apache.lucene.util.hnsw.FloatHeap;
  *       chance to find anything. Once the local queue is full, the search has reached its
  *       neighborhood and competitiveness against the rest of the query is meaningful.
  *   <li><b>Greediness clamp.</b> Even after the gate opens, the effective bound is capped by the
- *       similarity of the {@code max(}{@value #MIN_EXPLORATION_SLOTS}{@code , (1 - greediness) *
- *       k)}-th best score this collector has seen. A search that is globally non-competitive is
- *       thus throttled rather than stopped outright: it keeps following its most promising
- *       frontier, which preserves the paths through mediocre intermediate nodes that graph
- *       navigation depends on. At {@code greediness = 0} the floor has no effect; at {@code
- *       greediness = 1} the collector retains only the absolute minimum of exploration slots. See
- *       {@link #MIN_EXPLORATION_SLOTS} for why the clamp has an absolute lower bound.
+ *       similarity of the {@code max(minExplorationSlots, (1 - greediness) * k)}-th best score this
+ *       collector has seen. A search that is globally non-competitive is thus throttled rather than
+ *       stopped outright: it keeps following its most promising frontier, which preserves the paths
+ *       through mediocre intermediate nodes that graph navigation depends on. At {@code greediness
+ *       = 0} the floor has no effect; at {@code greediness = 1} the collector retains only the
+ *       absolute minimum of exploration slots. See {@link #DEFAULT_MIN_EXPLORATION_SLOTS} for why
+ *       the clamp has an absolute lower bound.
  *   <li><b>Batched synchronization.</b> Scores are published to the shared floor, and the floor is
- *       re-read, only when the local queue first fills and every {@value #SYNC_INTERVAL} visited
- *       vectors afterwards, so the shared state is touched a constant number of times per few
- *       hundred scored candidates rather than once per candidate. A stale floor can only delay
- *       termination, never cause a wrong result, so the interval trades a bounded amount of extra
- *       work for the absence of cross-thread traffic in the scoring loop.
+ *       re-read, only when the local queue first fills and every {@code syncInterval} visited
+ *       vectors afterwards (default {@value #DEFAULT_SYNC_INTERVAL}), so the shared state is
+ *       touched a constant number of times per few hundred scored candidates rather than once per
+ *       candidate. A stale floor can only delay termination, never cause a wrong result, so the
+ *       interval trades a bounded amount of extra work for the absence of cross-thread traffic in
+ *       the scoring loop.
  * </ul>
  *
  * <p>The effective bound derived from the floor is one ulp below the floor itself. The floor is the
@@ -81,28 +82,38 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
   public static final float DEFAULT_GREEDINESS = 0.5f;
 
   /**
-   * Minimum number of non-competitive queue slots, whatever the greediness. The protection a graph
-   * search needs against a tight external bound is an absolute number of below-bound candidates it
-   * may keep routing through, not a fraction of k: with a purely fractional clamp, a small-k search
-   * under high greediness is left a clamp one or two candidates wide, and randomized testing showed
-   * that costing double-digit recall. A useful side effect is that when k does not exceed this
-   * minimum, the clamp is at least as wide as the local queue and the shared floor is neutralized
-   * entirely: small-k searches behave exactly like stock search no matter what has been advertised.
+   * Default minimum number of non-competitive queue slots, whatever the greediness. The protection
+   * a graph search needs against a tight external bound is an absolute number of below-bound
+   * candidates it may keep routing through, not a fraction of k: with a purely fractional clamp, a
+   * small-k search under high greediness is left a clamp one or two candidates wide, and randomized
+   * testing showed that costing double-digit recall. A useful side effect is that when k does not
+   * exceed the configured minimum, the clamp is at least as wide as the local queue and the shared
+   * floor is neutralized entirely: small-k searches behave exactly like stock search no matter what
+   * has been advertised.
    */
-  public static final int MIN_EXPLORATION_SLOTS = 16;
+  public static final int DEFAULT_MIN_EXPLORATION_SLOTS = 16;
 
   /**
-   * Number of visited vectors between synchronizations with the shared floor. Must be one less than
-   * a power of two, as it is used as a bit mask over {@link #visitedCount()}.
+   * Default number of visited vectors between synchronizations with the shared floor. The value
+   * balances floor freshness (a staler floor prunes less, costing visits but never recall) against
+   * cross-thread traffic; it is the interval the removed {@code MultiLeafKnnCollector} shipped
+   * with.
    */
-  private static final int SYNC_INTERVAL = 0xff;
+  public static final int DEFAULT_SYNC_INTERVAL = 256;
 
   private final AbstractKnnCollector subCollector;
   private final GlobalKnnFloor globalFloor;
 
   /**
-   * The best {@code (1 - greediness) * k} similarities seen by this collector, competitive or not.
-   * Its minimum caps the effective bound, implementing the greediness clamp.
+   * Bit mask selecting the visited counts at which to synchronize, {@code syncInterval - 1}; the
+   * power-of-two requirement on the interval exists so this mask works.
+   */
+  private final int syncIntervalMask;
+
+  /**
+   * The best {@code max(minExplorationSlots, (1 - greediness) * k)} similarities seen by this
+   * collector, competitive or not. Its minimum caps the effective bound, implementing the
+   * greediness clamp.
    */
   private final FloatHeap nonCompetitiveQueue;
 
@@ -126,7 +137,7 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
   }
 
   /**
-   * Create a collector.
+   * Create a collector with an explicit greediness and default slot minimum and sync interval.
    *
    * @param subCollector the collector gathering this searcher's local results
    * @param globalFloor the floor shared by all searchers of this query
@@ -135,15 +146,52 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
    */
   public FloorAwareKnnCollector(
       AbstractKnnCollector subCollector, GlobalKnnFloor globalFloor, float greediness) {
+    this(
+        subCollector,
+        globalFloor,
+        greediness,
+        DEFAULT_MIN_EXPLORATION_SLOTS,
+        DEFAULT_SYNC_INTERVAL);
+  }
+
+  /**
+   * Create a fully configured collector.
+   *
+   * @param subCollector the collector gathering this searcher's local results
+   * @param globalFloor the floor shared by all searchers of this query
+   * @param greediness fraction of the search effort that follows the shared floor, in {@code [0,
+   *     1]}; see the class comment
+   * @param minExplorationSlots smallest permitted size of the greediness clamp's queue, whatever
+   *     the greediness; must be at least 1. See {@link #DEFAULT_MIN_EXPLORATION_SLOTS} for the role
+   *     this plays in protecting recall.
+   * @param syncInterval number of visited vectors between synchronizations with the shared floor;
+   *     must be a power of two. Smaller intervals keep the floor fresher (fewer visits) at the
+   *     price of more cross-thread traffic.
+   */
+  public FloorAwareKnnCollector(
+      AbstractKnnCollector subCollector,
+      GlobalKnnFloor globalFloor,
+      float greediness,
+      int minExplorationSlots,
+      int syncInterval) {
     super(subCollector);
     if (greediness < 0 || greediness > 1 || Float.isNaN(greediness)) {
       throw new IllegalArgumentException("greediness must be in [0,1], got: " + greediness);
     }
+    if (minExplorationSlots < 1) {
+      throw new IllegalArgumentException(
+          "minExplorationSlots must be at least 1, got: " + minExplorationSlots);
+    }
+    if (syncInterval < 1 || Integer.bitCount(syncInterval) != 1) {
+      throw new IllegalArgumentException(
+          "syncInterval must be a power of two, got: " + syncInterval);
+    }
     this.subCollector = subCollector;
     this.globalFloor = globalFloor;
+    this.syncIntervalMask = syncInterval - 1;
     this.nonCompetitiveQueue =
         new FloatHeap(
-            Math.max(MIN_EXPLORATION_SLOTS, Math.round((1 - greediness) * subCollector.k())));
+            Math.max(minExplorationSlots, Math.round((1 - greediness) * subCollector.k())));
     this.updatesQueue = new FloatHeap(globalFloor.k());
     this.updatesScratch = new float[globalFloor.k()];
   }
@@ -159,7 +207,7 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
     updatesQueue.offer(similarity);
     boolean globalSimUpdated = nonCompetitiveQueue.offer(similarity);
 
-    if (kResultsCollected && (firstKResultsCollected || (visitedCount() & SYNC_INTERVAL) == 0)) {
+    if (kResultsCollected && (firstKResultsCollected || (visitedCount() & syncIntervalMask) == 0)) {
       // The shared heap requires ascending input; draining the pending min-heap yields exactly
       // that. Scores observed before the local queue filled are included in the first batch, so
       // nothing seen during the ascent is lost to the shared floor.

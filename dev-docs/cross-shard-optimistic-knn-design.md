@@ -366,6 +366,15 @@ The default remains a conservative **g=0.5**; raising it is a measured, per-data
 sweeps). Unit tests pin the safe endpoint: at `g=0`, even the tightest valid advertised bound
 (the exact final k-th best) must not cost recall versus stock.
 
+**Configurability policy:** every tuning value is a constructor parameter with a documented
+default — greediness (0.5), slot minimum (16), sync interval (256, power of two), activation
+threshold (100). None of them is a truth; each is a placeholder for a measurement. The
+activation threshold in particular is the *inflection point* of this mechanism — like any
+distribution enhancement, the coordination tax only pays for itself past some k — and the §11
+sweeps (k ∈ {100, 200, 1000, 10000}) exist to locate that inflection empirically and replace
+the guessed default. The only hard-coded requirement in the implementation is `k ≥ 1`; nothing
+assumes a shard count, a segment count, or a corpus size.
+
 ## 7. Determinism
 
 #15686's removal note cites "non-deterministic results due to race conditions." Position:
