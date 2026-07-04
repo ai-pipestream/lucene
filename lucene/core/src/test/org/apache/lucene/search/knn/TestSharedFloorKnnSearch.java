@@ -49,6 +49,11 @@ import org.apache.lucene.util.NamedThreadFactory;
 /**
  * End-to-end tests of kNN search through {@link SharedFloorKnnCollectorManager}: the shared floor
  * must reduce work without changing what stock search would have found.
+ *
+ * <p>Queries here activate the floor at every k (see {@link SharedFloorKnnQuery}), because the
+ * point is to exercise the floor path; the activation default is covered by its own test. The k
+ * values exceed {@link FloorAwareKnnCollector#MIN_EXPLORATION_SLOTS}, since at or below it the
+ * clamp neutralizes the floor by design and the tests would not be testing anything.
  */
 public class TestSharedFloorKnnSearch extends LuceneTestCase {
 
@@ -62,7 +67,7 @@ public class TestSharedFloorKnnSearch extends LuceneTestCase {
   public void testRecallParityAcrossSegmentCounts() throws IOException {
     int dim = 16;
     int numDocs = 1200;
-    int k = 20;
+    int k = 64;
     int numQueries = 10;
     for (int segments : new int[] {1, 2, 5}) {
       float[][] vectors = new float[numDocs][];
@@ -109,11 +114,11 @@ public class TestSharedFloorKnnSearch extends LuceneTestCase {
    */
   public void testDecoyFirstSegmentDoesNotStarveLaterSegments() throws IOException {
     int dim = 16;
-    int k = 20;
+    int k = 64;
     int trueNeighborSegments = 4;
-    int trueNeighborsPerSegment = 5;
-    int backgroundPerSegment = 200;
-    int decoyCount = 300;
+    int trueNeighborsPerSegment = 16;
+    int backgroundPerSegment = 300;
+    int decoyCount = 400;
 
     float[] center = randomVector(dim);
     float[] decoyDirection = randomUnitVector(dim);
@@ -181,7 +186,7 @@ public class TestSharedFloorKnnSearch extends LuceneTestCase {
   public void testSequentialSearchIsDeterministic() throws IOException {
     int dim = 16;
     int numDocs = 1000;
-    int k = 15;
+    int k = 32;
     float[][] vectors = new float[numDocs][];
     for (int i = 0; i < numDocs; i++) {
       vectors[i] = randomVector(dim);
@@ -213,7 +218,7 @@ public class TestSharedFloorKnnSearch extends LuceneTestCase {
   public void testParallelRecallMatchesSequential() throws Exception {
     int dim = 16;
     int numDocs = 1200;
-    int k = 20;
+    int k = 64;
     int numQueries = 10;
     float[][] vectors = new float[numDocs][];
     for (int i = 0; i < numDocs; i++) {
@@ -264,8 +269,8 @@ public class TestSharedFloorKnnSearch extends LuceneTestCase {
    */
   public void testSlackAdvertisedBoundPreservesRecall() throws IOException {
     int dim = 16;
-    int numDocs = 1000;
-    int k = 10;
+    int numDocs = 1200;
+    int k = 64;
     int numQueries = 10;
     float[][] vectors = new float[numDocs][];
     for (int i = 0; i < numDocs; i++) {
@@ -303,17 +308,17 @@ public class TestSharedFloorKnnSearch extends LuceneTestCase {
   }
 
   /**
-   * At {@code greediness = 0} the non-competitive queue is as large as the local queue, so the
-   * effective bound can never exceed what the local search would have imposed on itself: the shared
-   * floor is fully neutralized. Recall must then match stock search even under the tightest bound
-   * that exists, the query's exact final k-th best similarity, advertised before the search starts.
-   * This pins down the greediness dial's safe endpoint; the recall cost of tighter settings under
-   * tight bounds is a measured trade, not a correctness property.
+   * At {@code greediness = 0} the non-competitive queue is at least as large as the local queue, so
+   * the effective bound can never exceed what the local search would have imposed on itself: the
+   * shared floor is fully neutralized. Recall must then match stock search even under the tightest
+   * bound that exists, the query's exact final k-th best similarity, advertised before the search
+   * starts. This pins down the greediness dial's safe endpoint; the recall cost of tighter settings
+   * under tight bounds is a measured trade, not a correctness property.
    */
   public void testZeroGreedinessNeutralizesTightestBound() throws IOException {
     int dim = 16;
-    int numDocs = 1000;
-    int k = 10;
+    int numDocs = 1200;
+    int k = 64;
     int numQueries = 10;
     float[][] vectors = new float[numDocs][];
     for (int i = 0; i < numDocs; i++) {
@@ -348,9 +353,59 @@ public class TestSharedFloorKnnSearch extends LuceneTestCase {
   }
 
   /**
+   * Below the activation threshold the manager creates plain collectors, so the search must be
+   * stock search to the last bit: identical documents and scores, even when a hostile (invalid)
+   * bound has been advertised. This is the policy layer that keeps small-k queries, where a floor
+   * has little to save and the most recall to lose, entirely out of the mechanism.
+   */
+  public void testBelowActivationThresholdSearchIsExactlyStock() throws IOException {
+    int dim = 16;
+    int numDocs = 1000;
+    int k = 10;
+    float[][] vectors = new float[numDocs][];
+    for (int i = 0; i < numDocs; i++) {
+      vectors[i] = randomVector(dim);
+    }
+    assertTrue(
+        "this test requires k below the default activation threshold",
+        k < SharedFloorKnnCollectorManager.DEFAULT_FLOOR_ACTIVATION_K);
+    try (Directory dir = newDirectory()) {
+      indexInSegments(dir, vectors, 4);
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        for (int i = 0; i < 5; i++) {
+          float[] query = randomVector(dim);
+          TopDocs stock = searcher.search(new KnnFloatVectorQuery(FIELD, query, k), k);
+
+          SharedFloorKnnQuery flooredQuery =
+              new SharedFloorKnnQuery(
+                  FIELD,
+                  query,
+                  k,
+                  FloorAwareKnnCollector.DEFAULT_GREEDINESS,
+                  SharedFloorKnnCollectorManager.DEFAULT_FLOOR_ACTIVATION_K);
+          // Deliberately invalid: far above any real similarity. Below the activation threshold
+          // it must not matter, because no collector ever consults the floor.
+          flooredQuery.manager.getGlobalFloor().advertise(Float.MAX_VALUE);
+          TopDocs floored = searcher.search(flooredQuery, k);
+
+          assertEquals(stock.scoreDocs.length, floored.scoreDocs.length);
+          for (int j = 0; j < stock.scoreDocs.length; j++) {
+            assertEquals("doc at rank " + j, stock.scoreDocs[j].doc, floored.scoreDocs[j].doc);
+            assertEquals(
+                "score at rank " + j, stock.scoreDocs[j].score, floored.scoreDocs[j].score, 0.0f);
+          }
+        }
+      }
+    }
+  }
+
+  /**
    * A {@link KnnFloatVectorQuery} routed through a {@link SharedFloorKnnCollectorManager}. The
    * manager is created with the query and returned for both collection passes, so both share one
    * floor; consequently a query instance carries single-execution state and must not be reused.
+   * Unless a threshold is given, the floor activates at every k, because these tests exist to
+   * exercise the floor path.
    */
   private static class SharedFloorKnnQuery extends KnnFloatVectorQuery {
     final SharedFloorKnnCollectorManager manager;
@@ -360,8 +415,15 @@ public class TestSharedFloorKnnSearch extends LuceneTestCase {
     }
 
     SharedFloorKnnQuery(String field, float[] target, int k, float greediness) {
+      this(field, target, k, greediness, 1);
+    }
+
+    SharedFloorKnnQuery(
+        String field, float[] target, int k, float greediness, int floorActivationK) {
       super(field, target, k);
-      this.manager = new SharedFloorKnnCollectorManager(k, new GlobalKnnFloor(k), greediness);
+      this.manager =
+          new SharedFloorKnnCollectorManager(
+              k, new GlobalKnnFloor(k), greediness, floorActivationK);
     }
 
     @Override

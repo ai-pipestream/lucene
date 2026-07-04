@@ -43,12 +43,13 @@ import org.apache.lucene.util.hnsw.FloatHeap;
  *       chance to find anything. Once the local queue is full, the search has reached its
  *       neighborhood and competitiveness against the rest of the query is meaningful.
  *   <li><b>Greediness clamp.</b> Even after the gate opens, the effective bound is capped by the
- *       similarity of the {@code (1 - greediness) * k}-th best score this collector has seen. A
- *       search that is globally non-competitive is thus throttled rather than stopped outright: it
- *       keeps following its most promising frontier, which preserves the paths through mediocre
- *       intermediate nodes that graph navigation depends on. At {@code greediness = 0} the floor
- *       has no effect; at {@code greediness = 1} the collector stops as soon as its best frontier
- *       cannot beat the floor.
+ *       similarity of the {@code max(}{@value #MIN_EXPLORATION_SLOTS}{@code , (1 - greediness) *
+ *       k)}-th best score this collector has seen. A search that is globally non-competitive is
+ *       thus throttled rather than stopped outright: it keeps following its most promising
+ *       frontier, which preserves the paths through mediocre intermediate nodes that graph
+ *       navigation depends on. At {@code greediness = 0} the floor has no effect; at {@code
+ *       greediness = 1} the collector retains only the absolute minimum of exploration slots. See
+ *       {@link #MIN_EXPLORATION_SLOTS} for why the clamp has an absolute lower bound.
  *   <li><b>Batched synchronization.</b> Scores are published to the shared floor, and the floor is
  *       re-read, only when the local queue first fills and every {@value #SYNC_INTERVAL} visited
  *       vectors afterwards, so the shared state is touched a constant number of times per few
@@ -74,12 +75,21 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
   /**
    * Default fraction of the search effort that follows the shared floor rather than the local
    * frontier; see the class comment for the roles of the two extremes. The default is deliberately
-   * conservative: at small k the local queue is small, and a larger greediness leaves so few
-   * non-competitive slots that the clamp stops protecting navigation paths, which measurably costs
-   * recall. Callers who have verified recall on their own data may trade some of it for fewer
+   * conservative. Callers who have verified recall on their own data may trade some of it for fewer
    * visits by raising this.
    */
   public static final float DEFAULT_GREEDINESS = 0.5f;
+
+  /**
+   * Minimum number of non-competitive queue slots, whatever the greediness. The protection a graph
+   * search needs against a tight external bound is an absolute number of below-bound candidates it
+   * may keep routing through, not a fraction of k: with a purely fractional clamp, a small-k search
+   * under high greediness is left a clamp one or two candidates wide, and randomized testing showed
+   * that costing double-digit recall. A useful side effect is that when k does not exceed this
+   * minimum, the clamp is at least as wide as the local queue and the shared floor is neutralized
+   * entirely: small-k searches behave exactly like stock search no matter what has been advertised.
+   */
+  public static final int MIN_EXPLORATION_SLOTS = 16;
 
   /**
    * Number of visited vectors between synchronizations with the shared floor. Must be one less than
@@ -132,7 +142,8 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
     this.subCollector = subCollector;
     this.globalFloor = globalFloor;
     this.nonCompetitiveQueue =
-        new FloatHeap(Math.max(1, Math.round((1 - greediness) * subCollector.k())));
+        new FloatHeap(
+            Math.max(MIN_EXPLORATION_SLOTS, Math.round((1 - greediness) * subCollector.k())));
     this.updatesQueue = new FloatHeap(globalFloor.k());
     this.updatesScratch = new float[globalFloor.k()];
   }

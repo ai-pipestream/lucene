@@ -343,11 +343,28 @@ approximation stock makes, at a tighter bar, with two explicit compensators":
 Consequently recall parity is an **empirical acceptance criterion** (§8), not a theorem.
 `g` is the recall/visits dial: `g=0` is stock, `g=1` is hard-stop. 0.9 shipped in Lucene 9.x as
 the `MultiLeafKnnCollector` default, but randomized small-k unit testing showed it costing
-several points of recall (at small k, `(1-g)·k` leaves too few non-competitive slots for the
-clamp to protect navigation paths), so the implementation defaults to a conservative **g=0.5**
-and treats raising it as a measured, per-dataset trade (§11 sweeps). Unit tests pin the safe
-endpoint: at `g=0`, even the tightest valid advertised bound (the exact final k-th best) must
-not cost recall versus stock.
+double-digit recall (worst observed: 0.96 → 0.71 at k=10 under the tightest valid bound). The
+diagnosis: the clamp was *fractional* (`(1-g)·k` slots) while the protection HNSW needs is
+*absolute* — a graph search needs some minimum number of below-bar candidates alive to route
+through, regardless of k. Two mechanisms fix this, both implemented:
+
+1. **Absolute slot minimum.** Clamp size = `max(16, (1-g)·k)` (`MIN_EXPLORATION_SLOTS`).
+   Emergent property: at `k ≤ 16` the clamp is at least as wide as the local queue and the
+   floor is *organically neutralized* — small-k search degrades to exactly stock behavior even
+   under a hostile advertised bound (unit-tested with `advertise(Float.MAX_VALUE)`).
+2. **Activation policy (the "when is collaboration acceptable" decision).** The manager engages
+   the floor only when the query's k reaches `floorActivationK` (default 100); below it, it
+   creates plain `TopKnnCollector`s — bit-identical to stock search, zero overhead, immune even
+   to invalid floors (unit-tested). The threshold is justified by the §10.1 math from both
+   directions: savings grow with k (`R = s/(1+λ√((s−1)/k))`, and with λ=16 the pro-rata padding
+   swamps the share at small k, leaving nothing for a floor to cut), while bridge-loss risk
+   concentrates at small k. Richer policies (segment count, corpus size, scout availability)
+   live in the engine layer by deciding which manager to construct per query — the manager *is*
+   the strategy seam; no new core interface is needed.
+
+The default remains a conservative **g=0.5**; raising it is a measured, per-dataset trade (§11
+sweeps). Unit tests pin the safe endpoint: at `g=0`, even the tightest valid advertised bound
+(the exact final k-th best) must not cost recall versus stock.
 
 ## 7. Determinism
 

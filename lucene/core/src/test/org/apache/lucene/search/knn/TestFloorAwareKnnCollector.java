@@ -35,18 +35,18 @@ public class TestFloorAwareKnnCollector extends LuceneTestCase {
   }
 
   public void testAscentGateIgnoresFloorUntilLocalQueueFills() {
-    int k = 5;
+    int k = FloorAwareKnnCollector.MIN_EXPLORATION_SLOTS + 4;
     GlobalKnnFloor floor = new GlobalKnnFloor(k);
     // A sibling searcher has already converged and established a high floor. A correct collector
     // must not expose it before this searcher has escaped its own ascent, otherwise the graph
     // search would be terminated at its entry point before finding anything.
-    floor.advertise(10f);
+    floor.advertise(1000f);
     FloorAwareKnnCollector collector =
         new FloorAwareKnnCollector(new TopKnnCollector(k, Integer.MAX_VALUE), floor);
 
     for (int doc = 0; doc < k - 1; doc++) {
       collector.incVisitedCount(1);
-      collector.collect(doc, 0.1f * (doc + 1));
+      collector.collect(doc, doc + 1f);
       assertEquals(
           "the shared floor must be invisible while the local queue is filling",
           Float.NEGATIVE_INFINITY,
@@ -55,94 +55,120 @@ public class TestFloorAwareKnnCollector extends LuceneTestCase {
     }
 
     collector.incVisitedCount(1);
-    collector.collect(k - 1, 0.1f * k);
+    collector.collect(k - 1, (float) k);
     assertTrue(
         "once the local queue is full, the shared floor must start binding",
         collector.minCompetitiveSimilarity() > Float.NEGATIVE_INFINITY);
+    // With k exceeding the clamp's minimum size, the bound must exceed the local k-th best (1):
+    // the floor is genuinely binding, not merely echoing the local queue.
+    assertTrue(collector.minCompetitiveSimilarity() > 1f);
   }
 
   public void testGreedinessClampCapsTheSharedFloor() {
-    int k = 4;
-    // greediness 0.5 keeps a non-competitive queue of (1 - 0.5) * 4 = 2 entries, so the effective
-    // bound may never exceed the second-best similarity this collector has seen.
+    // k and greediness sized so the fractional clamp exceeds the absolute minimum: 40 collected
+    // scores with greediness 0.5 keep a non-competitive queue of 20 entries, so the effective
+    // bound may never exceed the 20th best similarity this collector has seen.
+    int k = 40;
     float greediness = 0.5f;
     GlobalKnnFloor floor = new GlobalKnnFloor(k);
-    floor.advertise(100f);
+    floor.advertise(1000f);
     FloorAwareKnnCollector collector =
         new FloorAwareKnnCollector(new TopKnnCollector(k, Integer.MAX_VALUE), floor, greediness);
 
-    collector.incVisitedCount(1);
-    collector.collect(0, 1f);
-    collector.incVisitedCount(1);
-    collector.collect(1, 2f);
-    collector.incVisitedCount(1);
-    collector.collect(2, 3f);
-    collector.incVisitedCount(1);
-    collector.collect(3, 4f);
+    for (int doc = 0; doc < k; doc++) {
+      collector.incVisitedCount(1);
+      collector.collect(doc, doc + 1f);
+    }
 
-    // Local k-th best is 1, the second-best seen is 3, and the floor is 100. The clamp must win.
+    // Scores are 1..40: the local k-th best is 1, the 20th best seen is 21, and the floor is
+    // 1000. The clamp must win.
     assertEquals(
-        "the bound must be capped by the (1-greediness)*k-th best local similarity, not jump to "
-            + "the shared floor",
-        3f,
+        "the bound must be capped by the clamp queue's minimum, not jump to the shared floor",
+        21f,
         collector.minCompetitiveSimilarity(),
         0.0f);
   }
 
   public void testSharedFloorBindsOneUlpBelowItsValue() {
-    int localK = 4;
-    // Size the floor for a larger result set so the four local scores cannot define it: the only
-    // floor source in this test is the advertised bound.
+    int localK = 20;
+    // Size the floor for a larger result set so the local scores cannot define it: the only floor
+    // source in this test is the advertised bound.
     GlobalKnnFloor floor = new GlobalKnnFloor(100);
     floor.advertise(2.5f);
-    // greediness 1 collapses the clamp to the single best local similarity, letting the floor
-    // term be observed directly.
+    // greediness 1 collapses the clamp to its absolute minimum of MIN_EXPLORATION_SLOTS entries.
     FloorAwareKnnCollector collector =
         new FloorAwareKnnCollector(new TopKnnCollector(localK, Integer.MAX_VALUE), floor, 1f);
 
+    // Three scores below the advertised floor, then 17 above it: the local k-th best (1) stays
+    // below the floor while the clamp queue's minimum (the 16th best seen, 3.1) rises above it,
+    // so min(clamp, nextDown(floor)) selects the floor term.
     collector.incVisitedCount(1);
     collector.collect(0, 1f);
     collector.incVisitedCount(1);
     collector.collect(1, 1.2f);
     collector.incVisitedCount(1);
     collector.collect(2, 1.4f);
-    collector.incVisitedCount(1);
-    collector.collect(3, 4f);
+    for (int doc = 3; doc < localK; doc++) {
+      collector.incVisitedCount(1);
+      collector.collect(doc, 3f + 0.1f * (doc - 2));
+    }
 
-    // Local k-th best is 1 and the best-seen is 4, so min(bestSeen, nextDown(floor)) selects the
-    // floor term. The bound must sit strictly below the floor: a hit scoring exactly at the floor
-    // may still win the merged tie-break and must remain findable.
+    // The bound must sit strictly below the floor: a hit scoring exactly at the floor may still
+    // win the merged tie-break and must remain findable.
     assertEquals(Math.nextDown(2.5f), collector.minCompetitiveSimilarity(), 0.0f);
     assertTrue(collector.minCompetitiveSimilarity() < 2.5f);
   }
 
-  public void testCollectReportsSharedFloorUpdates() {
-    int k = 2;
+  public void testFloorIsNeutralizedAtSmallK() {
+    // When k does not exceed the clamp's absolute minimum, the clamp queue is at least as large
+    // as the local queue, its minimum can never exceed the local k-th best, and the shared floor
+    // must have no effect at all: even a hostile advertised bound cannot change the bound stock
+    // search would have used.
+    int k = FloorAwareKnnCollector.MIN_EXPLORATION_SLOTS / 2;
     GlobalKnnFloor floor = new GlobalKnnFloor(k);
-    // greediness 0 keeps a non-competitive queue of k entries; it mirrors the local queue, so a
-    // score rejected by both cannot report an update through either local structure.
+    floor.advertise(Float.MAX_VALUE);
+    TopKnnCollector delegate = new TopKnnCollector(k, Integer.MAX_VALUE);
+    FloorAwareKnnCollector collector = new FloorAwareKnnCollector(delegate, floor, 1f);
+
+    for (int doc = 0; doc < 3 * k; doc++) {
+      collector.incVisitedCount(1);
+      collector.collect(doc, random().nextFloat());
+      assertEquals(
+          "at k <= MIN_EXPLORATION_SLOTS the bound must be exactly the delegate's",
+          delegate.minCompetitiveSimilarity(),
+          collector.minCompetitiveSimilarity(),
+          0.0f);
+    }
+  }
+
+  public void testCollectReportsSharedFloorUpdates() {
+    // k equal to the clamp's absolute minimum makes both local structures the same size, so a
+    // score rejected by the local queue is also rejected by the clamp queue and cannot report an
+    // update through either.
+    int k = FloorAwareKnnCollector.MIN_EXPLORATION_SLOTS;
+    GlobalKnnFloor floor = new GlobalKnnFloor(k);
     FloorAwareKnnCollector collector =
         new FloorAwareKnnCollector(new TopKnnCollector(k, Integer.MAX_VALUE), floor, 0f);
 
-    collector.incVisitedCount(1);
-    assertTrue("a locally accepted hit must report an update", collector.collect(0, 5f));
-    collector.incVisitedCount(1);
-    assertTrue(collector.collect(1, 6f));
+    for (int doc = 0; doc < k; doc++) {
+      collector.incVisitedCount(1);
+      assertTrue("a locally accepted hit must report an update", collector.collect(doc, doc + 5f));
+    }
 
-    // Both queues hold {5, 6}. A worse score away from a synchronization boundary changes
+    // Both queues hold 5..k+4. A worse score away from a synchronization boundary changes
     // nothing and must say so, otherwise the searcher would re-derive its bound for no reason.
     collector.incVisitedCount(1);
     assertFalse(
         "a rejected hit between synchronizations must not report an update",
-        collector.collect(2, 1f));
+        collector.collect(k, 1f));
 
     // Advance to the next synchronization boundary: even a rejected hit must report an update
     // there, because the re-read of the shared floor may have moved the effective bound.
-    collector.incVisitedCount(253);
+    collector.incVisitedCount(256 - (k + 1));
     assertEquals(0, collector.visitedCount() & 0xff);
     assertTrue(
         "a hit on a synchronization boundary must report an update after the floor re-read",
-        collector.collect(3, 1f));
+        collector.collect(k + 1, 1f));
   }
 
   public void testDelegationOfCollectorPlumbing() {

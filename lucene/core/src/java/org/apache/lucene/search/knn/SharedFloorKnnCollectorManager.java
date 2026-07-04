@@ -43,6 +43,18 @@ import org.apache.lucene.search.TopKnnCollector;
  * and deduplicating documents that may appear in more than one index, is the caller's
  * responsibility; see {@link GlobalKnnFloor} for the exact contract.
  *
+ * <p>Floor sharing engages only when the query's k reaches an activation threshold; below it this
+ * manager creates plain, undecorated collectors and the search is exactly stock search. The two
+ * regimes justify the cutoff. The savings available to a shared bound grow with k: the pro-rata
+ * strategy sizes each segment's share as {@code k * proportion} plus {@code 16} standard deviations
+ * of a binomial, so at small k the statistical padding swamps the share and there is little
+ * redundant work left for a floor to eliminate, while at large k the padding is relatively
+ * negligible and most per-segment work above the merged cutoff is redundant. The recall risk moves
+ * the opposite way: the smaller k is, the closer any valid floor sits to scores an incomplete graph
+ * search routes through. Spending nothing and risking nothing below the threshold is therefore the
+ * right default, and deployments that have measured recall on their own data can lower it
+ * explicitly.
+ *
  * <p>A manager, like the floor it holds, carries the state of a single query execution: create one
  * per query, and never share one across queries. Both collector-creation methods may be called
  * concurrently, as segments are searched in parallel.
@@ -51,9 +63,16 @@ import org.apache.lucene.search.TopKnnCollector;
  */
 public final class SharedFloorKnnCollectorManager implements KnnCollectorManager {
 
+  /**
+   * Default smallest k at which floor sharing engages. See the class comment for why small-k
+   * queries are better served by stock search.
+   */
+  public static final int DEFAULT_FLOOR_ACTIVATION_K = 100;
+
   private final int k;
   private final GlobalKnnFloor globalFloor;
   private final float greediness;
+  private final int floorActivationK;
 
   /**
    * Create a manager with its own floor and the {@link FloorAwareKnnCollector#DEFAULT_GREEDINESS
@@ -79,7 +98,8 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
   }
 
   /**
-   * Create a manager around an externally provided floor with an explicit greediness.
+   * Create a manager around an externally provided floor with an explicit greediness, applying the
+   * {@link #DEFAULT_FLOOR_ACTIVATION_K default activation threshold}.
    *
    * @param k the number of neighbors the query collects
    * @param globalFloor the floor shared by all searchers of this query; its {@link
@@ -88,6 +108,24 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
    *     {@code [0, 1]}; see {@link FloorAwareKnnCollector}
    */
   public SharedFloorKnnCollectorManager(int k, GlobalKnnFloor globalFloor, float greediness) {
+    this(k, globalFloor, greediness, DEFAULT_FLOOR_ACTIVATION_K);
+  }
+
+  /**
+   * Create a manager around an externally provided floor with an explicit greediness and activation
+   * threshold.
+   *
+   * @param k the number of neighbors the query collects
+   * @param globalFloor the floor shared by all searchers of this query; its {@link
+   *     GlobalKnnFloor#k()} must equal {@code k}
+   * @param greediness fraction of each segment's search effort that follows the shared floor, in
+   *     {@code [0, 1]}; see {@link FloorAwareKnnCollector}
+   * @param floorActivationK the smallest k at which floor sharing engages; for smaller k this
+   *     manager creates plain collectors and the search is exactly stock search. See the class
+   *     comment for the reasoning behind the {@link #DEFAULT_FLOOR_ACTIVATION_K default}.
+   */
+  public SharedFloorKnnCollectorManager(
+      int k, GlobalKnnFloor globalFloor, float greediness, int floorActivationK) {
     if (k < 1) {
       throw new IllegalArgumentException("k must be at least 1, got: " + k);
     }
@@ -102,9 +140,14 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
     if (greediness < 0 || greediness > 1 || Float.isNaN(greediness)) {
       throw new IllegalArgumentException("greediness must be in [0,1], got: " + greediness);
     }
+    if (floorActivationK < 1) {
+      throw new IllegalArgumentException(
+          "floorActivationK must be at least 1, got: " + floorActivationK);
+    }
     this.k = k;
     this.globalFloor = globalFloor;
     this.greediness = greediness;
+    this.floorActivationK = floorActivationK;
   }
 
   /** Return the floor shared by this manager's collectors, so that callers may feed or read it. */
@@ -116,8 +159,11 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
   public KnnCollector newCollector(
       int visitedLimit, KnnSearchStrategy searchStrategy, LeafReaderContext context)
       throws IOException {
-    return new FloorAwareKnnCollector(
-        new TopKnnCollector(k, visitedLimit, searchStrategy), globalFloor, greediness);
+    TopKnnCollector collector = new TopKnnCollector(k, visitedLimit, searchStrategy);
+    if (k < floorActivationK) {
+      return collector;
+    }
+    return new FloorAwareKnnCollector(collector, globalFloor, greediness);
   }
 
   @Override
@@ -125,9 +171,13 @@ public final class SharedFloorKnnCollectorManager implements KnnCollectorManager
       int visitedLimit, KnnSearchStrategy searchStrategy, LeafReaderContext context, int perLeafK)
       throws IOException {
     // The local queue, and with it the ascent gate, is sized to the segment's pro-rata share; the
-    // floor itself always tracks the full k best across the query.
-    return new FloorAwareKnnCollector(
-        new TopKnnCollector(perLeafK, visitedLimit, searchStrategy), globalFloor, greediness);
+    // floor itself always tracks the full k best across the query. Activation is decided by the
+    // query's k, not the segment's share: the policy is about the query.
+    TopKnnCollector collector = new TopKnnCollector(perLeafK, visitedLimit, searchStrategy);
+    if (k < floorActivationK) {
+      return collector;
+    }
+    return new FloorAwareKnnCollector(collector, globalFloor, greediness);
   }
 
   @Override
