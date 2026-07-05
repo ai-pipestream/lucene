@@ -71,6 +71,110 @@ public class TestFloorAwareKnnCollector extends LuceneTestCase {
                 delegate, floor, 0.5f, FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS, -8));
   }
 
+  public void testInvalidGateK() {
+    GlobalKnnFloor floor = new GlobalKnnFloor(8);
+    TopKnnCollector delegate = new TopKnnCollector(8, Integer.MAX_VALUE);
+    expectThrows(
+        IllegalArgumentException.class,
+        () ->
+            new FloorAwareKnnCollector(
+                delegate,
+                floor,
+                0.5f,
+                FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS,
+                FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL,
+                0));
+    expectThrows(
+        IllegalArgumentException.class,
+        () ->
+            new FloorAwareKnnCollector(
+                delegate,
+                floor,
+                0.5f,
+                FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS,
+                FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL,
+                -1));
+    // A gate above the queue size could never open: the queue's size saturates at its capacity.
+    expectThrows(
+        IllegalArgumentException.class,
+        () ->
+            new FloorAwareKnnCollector(
+                delegate,
+                floor,
+                0.5f,
+                FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS,
+                FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL,
+                9));
+  }
+
+  public void testGateBelowQueueSizeOpensAtGateKResults() {
+    // A share-sized gate: the local queue holds 32 results but the collector's expected share of
+    // the merged top-k is only 8, so the floor must engage after 8 collected results, long before
+    // the queue fills. The local k-th best is still undefined at that point, so the exposed bound
+    // comes entirely from min(clamp, floor).
+    int queueSize = 32;
+    int gateK = 8;
+    GlobalKnnFloor floor = new GlobalKnnFloor(queueSize);
+    floor.advertise(1000f);
+    TopKnnCollector delegate = new TopKnnCollector(queueSize, Integer.MAX_VALUE);
+    // greediness 1 with a slot minimum of 2 keeps the two best scores seen as exploration slots.
+    FloorAwareKnnCollector collector =
+        new FloorAwareKnnCollector(
+            delegate, floor, 1f, 2, FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL, gateK);
+
+    for (int doc = 0; doc < gateK - 1; doc++) {
+      collector.incVisitedCount(1);
+      collector.collect(doc, doc + 1f);
+      assertEquals(
+          "the shared floor must be invisible until gateK results are collected",
+          Float.NEGATIVE_INFINITY,
+          collector.minCompetitiveSimilarity(),
+          0.0f);
+    }
+
+    collector.incVisitedCount(1);
+    collector.collect(gateK - 1, (float) gateK);
+    // Scores are 1..8: the clamp queue keeps {7, 8}, so the bound is min(7, nextDown(1000)) = 7,
+    // while the delegate's own bound is still NEGATIVE_INFINITY because its queue is not full.
+    assertEquals(Float.NEGATIVE_INFINITY, delegate.minCompetitiveSimilarity(), 0.0f);
+    assertEquals(
+        "once the gate opens, the bound must come from the clamp and the floor",
+        7f,
+        collector.minCompetitiveSimilarity(),
+        0.0f);
+  }
+
+  public void testGreedinessClampIsSizedFromGateK() {
+    // With a queue of 40 but a gate of 8 at greediness 0.5, the clamp must keep (1 - 0.5) * 8 = 4
+    // slots, not (1 - 0.5) * 40 = 20: the clamp protects the share-sized search the gate defines,
+    // not the queue's capacity.
+    int queueSize = 40;
+    int gateK = 8;
+    GlobalKnnFloor floor = new GlobalKnnFloor(queueSize);
+    floor.advertise(1000f);
+    FloorAwareKnnCollector collector =
+        new FloorAwareKnnCollector(
+            new TopKnnCollector(queueSize, Integer.MAX_VALUE),
+            floor,
+            0.5f,
+            1,
+            FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL,
+            gateK);
+
+    for (int doc = 0; doc < gateK; doc++) {
+      collector.incVisitedCount(1);
+      collector.collect(doc, doc + 1f);
+    }
+
+    // Scores are 1..8 and the clamp keeps the best 4 of them, {5, 6, 7, 8}: the bound must be the
+    // clamp's minimum, 5. A clamp sized from the queue would hold all 8 scores and expose 1.
+    assertEquals(
+        "the clamp must keep (1 - greediness) * gateK slots",
+        5f,
+        collector.minCompetitiveSimilarity(),
+        0.0f);
+  }
+
   public void testConfigurableSlotMinimumControlsNeutralization() {
     // The neutralization property follows the configured minimum, not a baked-in number: with a
     // slot minimum of 4 at k=8, the clamp is narrower than the local queue and an advertised

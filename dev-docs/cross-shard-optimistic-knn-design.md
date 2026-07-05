@@ -227,6 +227,47 @@ Three load-bearing decisions, each fixing a measured failure of #15676:
    answer to the memory-bus contention #15676 reported, and removes any need for
    striped/tree floors at realistic core counts.
 
+#### 4.2.1 The gate threshold is its own parameter (`gateK`): full-k fill loses to quota
+
+A measured negative result forced a fourth decision. In the simulated-shard rig (16 disjoint
+single-segment indexes, k=10000, each shard searched with a **full-k** collector wrapped in the
+floor), the floor arm was strictly worse than a static pro-rata quota with no sharing at all:
+
+| arm (k=10000, 16 shards)          | recall | visits/query |
+|-----------------------------------|--------|--------------|
+| static quota, perShardK=1012      | 0.969  | 115,438      |
+| full-k + floor, g=0.9             | 0.977  | 186,396      |
+| full-k + floor, g=0.5             | 0.989  | 569,472      |
+
+The mechanism is structural, not a tuning miss. When the gate threshold equals the local queue
+size and the queue is sized k, the floor cannot engage until the shard has *filled* a k-heap —
+roughly k collects of pure fill cost — while the quota arm fills `perShardK ≈ k/s + 16·√(k/s)`
+and stops. Whenever `perShardK ≪ k` (exactly the many-shard, large-k regime this design
+targets), the fill the gate forces costs more than everything the floor can later prune.
+Greediness cannot repair it: the gate, not the clamp, is what protects the fill.
+
+The fix is to decouple the two roles the queue size was playing:
+
+- **Queue size** = how much the searcher can *return* (capacity for its actual contribution,
+  which under skew may exceed its statistical share);
+- **`gateK`** = how much it must *collect* before the floor may influence it (the point where
+  its scores become informative — its expected share, not its capacity).
+
+`FloorAwareKnnCollector` therefore takes `gateK` (default: the queue size, which preserves the
+original behavior everywhere in-process — the optimistic path already sizes its sub-collectors
+at `perLeafK`, so its gate was already share-sized). The greediness clamp is sized from `gateK`
+too (`max(minExplorationSlots, (1-g)·gateK)`): it protects the share-sized search the gate
+defines, not the queue capacity, which at k=10000 and g=0.9 would otherwise leave a 1000-slot
+clamp that neutralizes the floor.
+
+The distributed configuration this enables — queue sized k, gate at `perShardK` — is the
+*adaptive quota*: every shard pays only quota-level fill cost, cold shards quit when their
+frontier falls below the shared floor, and hot shards (under skewed sharding) keep collecting
+above the floor up to full k without a second round trip. On uniformly sharded data there is
+little skew and static quota is already near-optimal; the floor's distributed value
+concentrates where sharding is semantic, temporal, or tenant-based and per-shard shares are
+unpredictable.
+
 ### 4.3 `SharedFloorKnnCollectorManager` — composition with optimistic
 
 ```java

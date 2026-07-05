@@ -36,20 +36,30 @@ import org.apache.lucene.util.hnsw.FloatHeap;
  * <p>Three guards keep the shared bound from harming recall or becoming a synchronization hot spot:
  *
  * <ul>
- *   <li><b>Ascent gate.</b> The shared floor is ignored until this collector has gathered its own k
- *       results. A graph search begins at an entry point that is usually far from the query, and
- *       every score observed while descending toward the query's neighborhood is uninformative; a
- *       bound derived from an already-converged sibling would terminate the search before it had a
- *       chance to find anything. Once the local queue is full, the search has reached its
+ *   <li><b>Ascent gate.</b> The shared floor is ignored until this collector has gathered {@code
+ *       gateK} results, which by default is the size of its local queue. A graph search begins at
+ *       an entry point that is usually far from the query, and every score observed while
+ *       descending toward the query's neighborhood is uninformative; a bound derived from an
+ *       already-converged sibling would terminate the search before it had a chance to find
+ *       anything. Once the gate's worth of results has been gathered, the search has reached its
  *       neighborhood and competitiveness against the rest of the query is meaningful.
+ *       <p>The gate may be set below the queue size when this collector's expected contribution to
+ *       the merged result set is smaller than the queue it collects into. A searcher of one shard
+ *       among many is statistically due only {@code k * proportion} of the query's final top-k, yet
+ *       must be able to return more than that share when its shard actually holds more; gating at
+ *       the expected share instead of at the queue size lets the search pay only the share's fill
+ *       cost before the floor starts deciding whether continuing is worthwhile, while the full-size
+ *       queue keeps every above-floor result the shard turns out to hold. Gating at the queue size
+ *       in that configuration would force every shard to collect k results before pruning could
+ *       begin, which costs more than not sharing a floor at all.
  *   <li><b>Greediness clamp.</b> Even after the gate opens, the effective bound is capped by the
- *       similarity of the {@code max(minExplorationSlots, (1 - greediness) * k)}-th best score this
- *       collector has seen. A search that is globally non-competitive is thus throttled rather than
- *       stopped outright: it keeps following its most promising frontier, which preserves the paths
- *       through mediocre intermediate nodes that graph navigation depends on. At {@code greediness
- *       = 0} the floor has no effect; at {@code greediness = 1} the collector retains only the
- *       absolute minimum of exploration slots. See {@link #DEFAULT_MIN_EXPLORATION_SLOTS} for why
- *       the clamp has an absolute lower bound.
+ *       similarity of the {@code max(minExplorationSlots, (1 - greediness) * gateK)}-th best score
+ *       this collector has seen. A search that is globally non-competitive is thus throttled rather
+ *       than stopped outright: it keeps following its most promising frontier, which preserves the
+ *       paths through mediocre intermediate nodes that graph navigation depends on. At {@code
+ *       greediness = 0} the floor has no effect; at {@code greediness = 1} the collector retains
+ *       only the absolute minimum of exploration slots. See {@link #DEFAULT_MIN_EXPLORATION_SLOTS}
+ *       for why the clamp has an absolute lower bound.
  *   <li><b>Batched synchronization.</b> Scores are published to the shared floor, and the floor is
  *       re-read, only when the local queue first fills and every {@code syncInterval} visited
  *       vectors afterwards (default {@value #DEFAULT_SYNC_INTERVAL}), so the shared state is
@@ -105,6 +115,12 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
   private final GlobalKnnFloor globalFloor;
 
   /**
+   * Number of locally collected results after which the shared floor engages; the ascent gate's
+   * threshold. See the class comment.
+   */
+  private final int gateK;
+
+  /**
    * Bit mask selecting the visited counts at which to synchronize, {@code syncInterval - 1}; the
    * power-of-two requirement on the interval exists so this mask works.
    */
@@ -123,7 +139,7 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
   /** Scratch used to drain {@link #updatesQueue} in ascending order for batch publication. */
   private final float[] updatesScratch;
 
-  private boolean kResultsCollected;
+  private boolean gateOpened;
   private float cachedGlobalFloor = Float.NEGATIVE_INFINITY;
 
   /**
@@ -155,7 +171,8 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
   }
 
   /**
-   * Create a fully configured collector.
+   * Create a collector whose ascent gate opens when its local queue fills, with an explicit
+   * greediness, slot minimum and sync interval.
    *
    * @param subCollector the collector gathering this searcher's local results
    * @param globalFloor the floor shared by all searchers of this query
@@ -174,6 +191,36 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
       float greediness,
       int minExplorationSlots,
       int syncInterval) {
+    this(
+        subCollector, globalFloor, greediness, minExplorationSlots, syncInterval, subCollector.k());
+  }
+
+  /**
+   * Create a fully configured collector.
+   *
+   * @param subCollector the collector gathering this searcher's local results
+   * @param globalFloor the floor shared by all searchers of this query
+   * @param greediness fraction of the search effort that follows the shared floor, in {@code [0,
+   *     1]}; see the class comment
+   * @param minExplorationSlots smallest permitted size of the greediness clamp's queue, whatever
+   *     the greediness; must be at least 1. See {@link #DEFAULT_MIN_EXPLORATION_SLOTS} for the role
+   *     this plays in protecting recall.
+   * @param syncInterval number of visited vectors between synchronizations with the shared floor;
+   *     must be a power of two. Smaller intervals keep the floor fresher (fewer visits) at the
+   *     price of more cross-thread traffic.
+   * @param gateK the number of locally collected results after which the shared floor engages, in
+   *     {@code [1, subCollector.k()]}. The default, used by the other constructors, is {@code
+   *     subCollector.k()}: the floor engages when the local queue fills. Set it below the queue
+   *     size when this collector's expected share of the merged top-k is smaller than the queue it
+   *     collects into; see the class comment on the ascent gate for when that applies.
+   */
+  public FloorAwareKnnCollector(
+      AbstractKnnCollector subCollector,
+      GlobalKnnFloor globalFloor,
+      float greediness,
+      int minExplorationSlots,
+      int syncInterval,
+      int gateK) {
     super(subCollector);
     if (greediness < 0 || greediness > 1 || Float.isNaN(greediness)) {
       throw new IllegalArgumentException("greediness must be in [0,1], got: " + greediness);
@@ -186,12 +233,16 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
       throw new IllegalArgumentException(
           "syncInterval must be a power of two, got: " + syncInterval);
     }
+    if (gateK < 1 || gateK > subCollector.k()) {
+      throw new IllegalArgumentException(
+          "gateK must be in [1, subCollector.k()=" + subCollector.k() + "], got: " + gateK);
+    }
     this.subCollector = subCollector;
     this.globalFloor = globalFloor;
+    this.gateK = gateK;
     this.syncIntervalMask = syncInterval - 1;
     this.nonCompetitiveQueue =
-        new FloatHeap(
-            Math.max(minExplorationSlots, Math.round((1 - greediness) * subCollector.k())));
+        new FloatHeap(Math.max(minExplorationSlots, Math.round((1 - greediness) * gateK)));
     this.updatesQueue = new FloatHeap(globalFloor.k());
     this.updatesScratch = new float[globalFloor.k()];
   }
@@ -199,18 +250,17 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
   @Override
   public boolean collect(int docId, float similarity) {
     boolean localSimUpdated = subCollector.collect(docId, similarity);
-    boolean firstKResultsCollected =
-        kResultsCollected == false && subCollector.numCollected() == k();
-    if (firstKResultsCollected) {
-      kResultsCollected = true;
+    boolean gateJustOpened = gateOpened == false && subCollector.numCollected() >= gateK;
+    if (gateJustOpened) {
+      gateOpened = true;
     }
     updatesQueue.offer(similarity);
     boolean globalSimUpdated = nonCompetitiveQueue.offer(similarity);
 
-    if (kResultsCollected && (firstKResultsCollected || (visitedCount() & syncIntervalMask) == 0)) {
+    if (gateOpened && (gateJustOpened || (visitedCount() & syncIntervalMask) == 0)) {
       // The shared heap requires ascending input; draining the pending min-heap yields exactly
-      // that. Scores observed before the local queue filled are included in the first batch, so
-      // nothing seen during the ascent is lost to the shared floor.
+      // that. Scores observed before the gate opened are included in the first batch, so nothing
+      // seen during the ascent is lost to the shared floor.
       int len = updatesQueue.size();
       if (len > 0) {
         for (int i = 0; i < len; i++) {
@@ -229,9 +279,9 @@ public final class FloorAwareKnnCollector extends KnnCollector.Decorator {
 
   @Override
   public float minCompetitiveSimilarity() {
-    if (kResultsCollected == false) {
-      // Ascent gate: while the local queue is filling, expose only the delegate's bound, which is
-      // NEGATIVE_INFINITY by the KnnCollector contract. See the class comment.
+    if (gateOpened == false) {
+      // Ascent gate: until gateK results have been collected, expose only the delegate's bound,
+      // which is NEGATIVE_INFINITY by the KnnCollector contract. See the class comment.
       return subCollector.minCompetitiveSimilarity();
     }
     // nextDown keeps the bound strictly below the floor so exact score ties at the cutoff remain
