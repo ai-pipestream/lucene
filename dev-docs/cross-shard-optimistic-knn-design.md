@@ -261,12 +261,24 @@ defines, not the queue capacity, which at k=10000 and g=0.9 would otherwise leav
 clamp that neutralizes the floor.
 
 The distributed configuration this enables — queue sized k, gate at `perShardK` — is the
-*adaptive quota*: every shard pays only quota-level fill cost, cold shards quit when their
-frontier falls below the shared floor, and hot shards (under skewed sharding) keep collecting
-above the floor up to full k without a second round trip. On uniformly sharded data there is
-little skew and static quota is already near-optimal; the floor's distributed value
-concentrates where sharding is semantic, temporal, or tenant-based and per-shard shares are
-unpredictable.
+*adaptive quota*: every shard pays only quota-level fill cost, shards quit when their frontier
+falls below the shared floor, and a shard holding more than its statistical share keeps
+collecting above the floor up to full k without a second round trip.
+
+Why this matters is *not* skew-chasing. Distributed engines hash documents to shards, so
+per-shard contributions are near-uniform and a static quota's prediction is usually right —
+yet no engine ships static quotas, and OpenSearch and Elasticsearch search every shard at
+full k today. The reason is safety: in-process Lucene can afford the optimistic quota because
+re-entry (re-searching a leaf that proved under-allocated) is a method call, while across
+shards re-entry is a second network round trip on the latency-critical path. Quota without a
+correction mechanism silently loses recall whenever uniformity breaks — deletions, custom
+routing, filtered kNN whose filter correlates with shards, multi-index searches, or plain
+tail variance. The shared floor *is* the correction mechanism, and it works in a single
+pass: the floor certifies which shards are genuinely done, and any under-served shard extends
+itself for exactly as long as its frontier still beats the merged cutoff. The adaptive quota
+therefore offers distributed engines the pair they cannot have today: quota-level cost with
+full-k-level safety, no second round trip. Uniform data is the common case where the safety
+net rarely fires; non-uniform cases are handled by the same mechanism at no extra cost.
 
 ### 4.3 `SharedFloorKnnCollectorManager` — composition with optimistic
 
