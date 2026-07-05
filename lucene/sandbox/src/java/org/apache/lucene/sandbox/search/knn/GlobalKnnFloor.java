@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
-package org.apache.lucene.search.knn;
+package org.apache.lucene.sandbox.search.knn;
 
 import java.util.concurrent.atomic.LongAccumulator;
 import org.apache.lucene.util.NumericUtils;
-import org.apache.lucene.util.hnsw.BlockingFloatHeap;
 
 /**
  * Shared, per-query lower bound on the similarity of the k-th best result of a kNN search whose

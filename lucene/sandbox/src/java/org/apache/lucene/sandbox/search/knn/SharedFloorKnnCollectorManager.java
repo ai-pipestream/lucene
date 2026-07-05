@@ -15,13 +15,15 @@
  * limitations under the License.
  */
 
-package org.apache.lucene.search.knn;
+package org.apache.lucene.sandbox.search.knn;
 
 import java.io.IOException;
 import java.util.Objects;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.TopKnnCollector;
+import org.apache.lucene.search.knn.KnnCollectorManager;
+import org.apache.lucene.search.knn.KnnSearchStrategy;
 
 /**
  * A {@link KnnCollectorManager} whose collectors share a {@link GlobalKnnFloor}, so that every

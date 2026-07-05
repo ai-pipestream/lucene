@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.lucene.util.hnsw;
+package org.apache.lucene.sandbox.search.knn;
 
 import java.util.concurrent.locks.ReentrantLock;
 

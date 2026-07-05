@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.lucene.util.hnsw;
+package org.apache.lucene.sandbox.search.knn;
 
 import static com.carrotsearch.randomizedtesting.RandomizedTest.randomIntBetween;
 

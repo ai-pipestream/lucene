@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.lucene.search.knn;
+package org.apache.lucene.sandbox.search.knn;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -42,6 +42,7 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.knn.KnnCollectorManager;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.util.NamedThreadFactory;

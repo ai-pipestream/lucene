@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.lucene.search.knn;
+package org.apache.lucene.sandbox.search.knn;
 
 import org.apache.lucene.search.AbstractKnnCollector;
 import org.apache.lucene.search.KnnCollector;
