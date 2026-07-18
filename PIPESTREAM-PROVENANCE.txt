@@ -1,0 +1,10 @@
+# ai.pipestream:lucene-* provenance
+# Built from unmerged development branches of Apache Lucene.
+# Not an Apache Software Foundation release. Apache Lucene is a trademark of the ASF.
+version: 11.0.0-experimental-SNAPSHOT
+generated: 2026-07-18
+main: 8fe701c0873 SkipBlockRangeIterator should report docCount as its cost (#16352)
+ref: 075902932e1 Add shared-floor kNN collection to the sandbox module
+ref: 49445437ee6 Harden shared-floor kNN collection: fill race, per-shard gating, publish-once
+ref: 299c943f23c Derive greediness from a target clamp width
+ref: 56980540711 Validate shared-floor inputs and clarify the approximate-search contract

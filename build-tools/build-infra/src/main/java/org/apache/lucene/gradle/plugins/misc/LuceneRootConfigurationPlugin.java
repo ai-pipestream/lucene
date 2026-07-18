@@ -113,7 +113,7 @@ public class LuceneRootConfigurationPlugin extends LuceneGradlePlugin {
   }
 
   private void applyCommonConfiguration(Project project) {
-    project.setGroup("org.apache.lucene");
+    project.setGroup("ai.pipestream");
     if (project != project.getRootProject()) {
       project.setVersion(project.getRootProject().getVersion());
     }
