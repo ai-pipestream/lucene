@@ -32,3 +32,15 @@ Apache Lucene project; upstream owns none of this build.
 Build group differs from upstream deliberately: `ai.pipestream` instead of
 `org.apache.lucene`, so this line can never shadow or be shadowed by official
 Lucene artifacts on a classpath or in a repository.
+
+## Resolving the artifacts
+
+Snapshots publish to the ai.pipestream registry; consumers add one repository:
+
+```groovy
+maven { url = uri('https://git.rokkon.com/api/packages/ai-pipestream/maven') }
+```
+
+From this branch, `./gradlew mavenToLocal` installs to the local `~/.m2`
+instead, and `./gradlew mavenToForgejo` republishes the registry snapshot
+(with `FORGEJO_TOKEN` in the environment).
