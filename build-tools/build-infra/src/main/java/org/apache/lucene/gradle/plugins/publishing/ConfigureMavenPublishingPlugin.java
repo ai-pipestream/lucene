@@ -62,6 +62,50 @@ public class ConfigureMavenPublishingPlugin extends LuceneGradlePlugin {
     configurePublicationsToLocalBuildDirectory(project);
     configurePublicationsToApacheNexus(project, true);
     configurePublicationsToApacheNexus(project, false);
+    configurePublicationsToForgejo(project);
+  }
+
+  /**
+   * Configure artifact push to the ai.pipestream Forgejo snapshot registry. Fork snapshots
+   * publish there; releases stay on the Apache path. Enabled when FORGEJO_TOKEN is set.
+   */
+  private void configurePublicationsToForgejo(Project project) {
+    var providers = project.getProviders();
+    var forgejoToken = providers.environmentVariable("FORGEJO_TOKEN");
+    if (!forgejoToken.isPresent()) {
+      return;
+    }
+    var forgejoActor = providers.environmentVariable("FORGEJO_ACTOR").orElse("ci");
+
+    for (var p : getLuceneBuildGlobals(project).getPublishedProjects()) {
+      var publishingExtension = p.getExtensions().getByType(PublishingExtension.class);
+      publishingExtension
+          .getRepositories()
+          .maven(
+              repo -> {
+                repo.setName("Forgejo");
+                repo.setUrl("https://git.rokkon.com/api/packages/ai-pipestream/maven");
+                repo.credentials(
+                    creds -> {
+                      creds.setUsername(forgejoActor.get());
+                      creds.setPassword(forgejoToken.get());
+                    });
+              });
+    }
+
+    project
+        .getTasks()
+        .register(
+            "mavenToForgejo",
+            task -> {
+              task.setGroup("Distribution");
+              task.setDescription(
+                  "Publish Lucene Maven artifacts to the ai.pipestream Forgejo snapshot registry.");
+              task.dependsOn(
+                  getLuceneBuildGlobals(project).getPublishedProjects().stream()
+                      .map(p -> p.getTasks().named("publishJarsPublicationToForgejoRepository"))
+                      .toList());
+            });
   }
 
   /** Configure artifact push to apache nexus (releases or snapshots repository). */
