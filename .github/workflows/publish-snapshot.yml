@@ -1,0 +1,30 @@
+name: Publish fork snapshot
+
+# Publishes the ai.pipestream:lucene-* snapshot to the ai.pipestream registry on every
+# push to the fork integration branch. Tests do not run here; this is a packaging step
+# over code that was built and tested on the feature branches.
+on:
+  push:
+    branches:
+      - kristian-11.x-features
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Publish ai.pipestream:lucene-* snapshot
+        env:
+          FORGEJO_ACTOR: ${{ github.actor }}
+          FORGEJO_TOKEN: ${{ secrets.CICD_TOKEN }}
+        run: ./gradlew mavenToForgejo --no-daemon
