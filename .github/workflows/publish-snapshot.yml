@@ -16,7 +16,7 @@ jobs:
   publish:
     # The registry is on the private network: this runs only on the Forgejo instance's
     # self-hosted runners, and skips cleanly on github.com.
-    if: ${{ github.server_url == 'https://git.rokkon.com' }}
+    if: ${{ github.server_url != 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
