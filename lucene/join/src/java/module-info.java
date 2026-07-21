@@ -18,6 +18,7 @@
 /** Index-time and Query-time joins for normalized content */
 module org.apache.lucene.join {
   requires org.apache.lucene.core;
+  requires org.apache.lucene.sandbox;
 
   exports org.apache.lucene.search.join;
 }

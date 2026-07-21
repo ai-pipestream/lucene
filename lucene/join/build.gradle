@@ -21,6 +21,7 @@ description = 'Index-time and Query-time joins for normalized content'
 
 dependencies {
   moduleApi project(':lucene:core')
+  moduleApi project(':lucene:sandbox')
 
   moduleTestImplementation project(':lucene:test-framework')
 }
