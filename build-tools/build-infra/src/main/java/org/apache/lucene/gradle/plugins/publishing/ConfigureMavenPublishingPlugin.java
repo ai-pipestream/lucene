@@ -63,11 +63,12 @@ public class ConfigureMavenPublishingPlugin extends LuceneGradlePlugin {
     configurePublicationsToApacheNexus(project, true);
     configurePublicationsToApacheNexus(project, false);
     configurePublicationsToForgejo(project);
+    configurePublicationsToCentralSnapshots(project);
   }
 
   /**
-   * Configure artifact push to the ai.pipestream Forgejo snapshot registry. Fork snapshots
-   * publish there; releases stay on the Apache path. Enabled when FORGEJO_TOKEN is set.
+   * Configure artifact push to the ai.pipestream Forgejo snapshot registry. Fork snapshots publish
+   * there; releases stay on the Apache path. Enabled when FORGEJO_TOKEN is set.
    */
   private void configurePublicationsToForgejo(Project project) {
     var providers = project.getProviders();
@@ -104,6 +105,54 @@ public class ConfigureMavenPublishingPlugin extends LuceneGradlePlugin {
               task.dependsOn(
                   getLuceneBuildGlobals(project).getPublishedProjects().stream()
                       .map(p -> p.getTasks().named("publishJarsPublicationToForgejoRepository"))
+                      .toList());
+            });
+  }
+
+  /**
+   * Configure artifact push to Maven Central's snapshot repository. Fork snapshots publish there so
+   * infrastructure that cannot reach the ai.pipestream registry (GitHub-hosted runners, notably)
+   * can still resolve them; releases stay on the Apache path. Enabled when MAVEN_CENTRAL_USERNAME
+   * and MAVEN_CENTRAL_PASSWORD are set.
+   */
+  private void configurePublicationsToCentralSnapshots(Project project) {
+    var providers = project.getProviders();
+    var centralUsername = providers.environmentVariable("MAVEN_CENTRAL_USERNAME");
+    var centralPassword = providers.environmentVariable("MAVEN_CENTRAL_PASSWORD");
+    if (!centralUsername.isPresent() || !centralPassword.isPresent()) {
+      return;
+    }
+
+    for (var p : getLuceneBuildGlobals(project).getPublishedProjects()) {
+      var publishingExtension = p.getExtensions().getByType(PublishingExtension.class);
+      publishingExtension
+          .getRepositories()
+          .maven(
+              repo -> {
+                repo.setName("CentralSnapshots");
+                repo.setUrl("https://central.sonatype.com/repository/maven-snapshots");
+                repo.credentials(
+                    creds -> {
+                      creds.setUsername(centralUsername.get());
+                      creds.setPassword(centralPassword.get());
+                    });
+              });
+    }
+
+    project
+        .getTasks()
+        .register(
+            "mavenToCentralSnapshots",
+            task -> {
+              task.setGroup("Distribution");
+              task.setDescription(
+                  "Publish Lucene Maven artifacts to Maven Central's snapshot repository.");
+              task.dependsOn(
+                  getLuceneBuildGlobals(project).getPublishedProjects().stream()
+                      .map(
+                          p ->
+                              p.getTasks()
+                                  .named("publishJarsPublicationToCentralSnapshotsRepository"))
                       .toList());
             });
   }
